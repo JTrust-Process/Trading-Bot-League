@@ -1,0 +1,78 @@
+name: ETF Rotation v1 (paper)
+
+on:
+  schedule:
+    # Offset 33 minutes past so it doesn't collide with the stock bot (:17),
+    # the crypto bot (:07/:22/:37/:52), or league_health (:09/:24/:39/:54).
+    # Hourly during US market hours, Monday-Friday.
+    # 14:33 - 20:33 UTC = 10:33 - 16:33 ET during EDT, 09:33 - 15:33 ET during EST.
+    - cron: "33 14-20 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: etf-rotation-v1
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # ── Public.com bars ──
+      PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
+
+      # ── League Supabase project ──
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      # Service-role key — this bot writes runs / events / trades / positions.
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+      LEAGUE_BOT_ID: "etf_rotation_v1"
+
+      # ── Strategy / sizing ──
+      ETF_PAPER_CAPITAL: "1000"
+      ETF_BARS_PERIOD: "YEAR"
+
+      TZ: "America/New_York"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore bot state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bots/etf_rotation_v1/state.json
+          key: etf-rotation-v1-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            etf-rotation-v1-state-${{ github.ref_name }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r bots/etf_rotation_v1/requirements.txt
+
+      - name: Run cycle
+        # Run from the repo root so `from league_core...` and `from bots...`
+        # resolve. main.py inserts the repo root into sys.path defensively,
+        # but invoking via `python -m` keeps cwd canonical.
+        run: python -m bots.etf_rotation_v1.main
+
+      - name: Save bot state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bots/etf_rotation_v1/state.json
+          key: etf-rotation-v1-state-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Upload state artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etf-rotation-v1-state-${{ github.run_id }}
+          path: bots/etf_rotation_v1/state.json
+          retention-days: 7
+          if-no-files-found: ignore

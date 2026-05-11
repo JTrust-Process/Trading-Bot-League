@@ -1,0 +1,7 @@
+# bots/etf_rotation_v1 — runtime dependencies.
+# Kept lean: we use raw HTTP for both Public's bars endpoint and Supabase's
+# PostgREST writes, so requests is the only third-party need. python-dotenv
+# is here so local runs can read a .env file; in GHA the env is injected
+# directly and python-dotenv is a no-op (import is wrapped in try/except).
+requests
+python-dotenv

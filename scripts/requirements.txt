@@ -1,0 +1,4 @@
+# Trading Bot League — script dependencies (league_health.py).
+# Keep this lean. We talk to Supabase over PostgREST and Discord over a
+# webhook; both are plain HTTP, so requests is all we need.
+requests

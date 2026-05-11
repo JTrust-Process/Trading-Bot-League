@@ -1,0 +1,55 @@
+name: League Health
+
+on:
+  schedule:
+    # Offset 9 minutes past so it doesn't collide with bot crons that run at
+    # :07/:17/:22/:37/:52. Pings Discord on state transitions only.
+    - cron: "9,24,39,54 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: league-health
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      # Anon key is sufficient — the script only reads (registry + status)
+      # and writes nothing back to Supabase.
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_ANON_KEY }}
+      LEAGUE_DISCORD_WEBHOOK_URL: ${{ secrets.LEAGUE_DISCORD_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore status_state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: status_state.json
+          key: league-health-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            league-health-state-${{ github.ref_name }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r scripts/requirements.txt
+
+      - name: Run health check
+        run: python scripts/league_health.py
+
+      - name: Save status_state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: status_state.json
+          key: league-health-state-${{ github.ref_name }}-${{ github.run_id }}
