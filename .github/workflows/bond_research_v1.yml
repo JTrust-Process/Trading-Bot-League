@@ -1,0 +1,52 @@
+name: Bond Research v1 (research-only)
+
+on:
+  schedule:
+    # Once a day at 14:35 UTC (10:35 ET during EDT, 09:35 ET during EST).
+    # Daily-bar inputs only refresh once per session, so a single midday
+    # run is enough. Offset minute :35 to avoid collisions with the
+    # stock bot (:17), crypto bot (:07/:22/:37/:52), etf bot (:33),
+    # and league_health (:09/:24/:39/:54).
+    - cron: "35 14 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: bond-research-v1
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Public.com bars (read-only)
+      PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
+
+      # League Supabase project
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+      LEAGUE_BOT_ID: "bond_research_v1"
+
+      # Strategy config
+      BOND_BARS_PERIOD: "YEAR"
+
+      TZ: "America/New_York"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r bots/bond_research_v1/requirements.txt
+
+      - name: Run screener
+        # Invoke via `python -m` from the repo root so `from league_core...`
+        # and `from bots.bond_research_v1...` resolve cleanly.
+        run: python -m bots.bond_research_v1.main

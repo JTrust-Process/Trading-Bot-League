@@ -467,6 +467,47 @@ def _get_open_position(cfg: dict[str, str], symbol: str) -> Optional[dict[str, A
     return None
 
 
+def log_research_score(
+    symbol: str,
+    asset_class: str,
+    *,
+    score: Optional[float] = None,
+    classification: Optional[str] = None,
+    period: Optional[str] = None,
+    metrics: Optional[dict[str, Any]] = None,
+    notes: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> None:
+    """Insert a row into bot_research_scores. Fail-silent.
+
+    classification must be one of: 'keep_active' | 'reduce_priority' |
+    'paper_only' | 'remove' (matches the stock bot's analyze_backtests.py
+    buckets) or None. asset_class must match the CHECK constraint.
+    """
+    cfg = _config()
+    if cfg is None:
+        return
+    if classification is not None and classification not in (
+        "keep_active", "reduce_priority", "paper_only", "remove"
+    ):
+        _print(f"log_research_score: invalid classification={classification!r}; "
+               f"writing as null")
+        classification = None
+    row: dict[str, Any] = {
+        "bot_id":         cfg["bot_id"],
+        "run_id":         run_id,
+        "scored_at":      _now_iso(),
+        "symbol":         symbol,
+        "asset_class":    asset_class,
+        "period":         period,
+        "score":          score,
+        "classification": classification,
+        "metrics":        metrics or {},
+        "notes":          notes,
+    }
+    _post(cfg, "bot_research_scores", [row], upsert=False)
+
+
 __all__ = [
     "heartbeat",
     "start_run",
@@ -476,4 +517,5 @@ __all__ = [
     "log_event",
     "upsert_position",
     "close_position",
+    "log_research_score",
 ]

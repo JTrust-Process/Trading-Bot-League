@@ -1,0 +1,4 @@
+# bots/bond_research_v1 — runtime dependencies.
+# Pure HTTP for Public bars + Supabase REST. No pandas needed.
+requests
+python-dotenv
