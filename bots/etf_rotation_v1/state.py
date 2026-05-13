@@ -20,7 +20,12 @@ import json
 import os
 from typing import Any, Dict
 
-STATE_FILE = "state.json"
+# Anchor state.json to THIS file's directory rather than the process cwd.
+# GitHub Actions runs the bot as `python -m bots.etf_rotation_v1.main` from
+# the repo root, so cwd is `<repo>/`. Without this anchor, state.json was
+# being written to the repo root and the workflow's cache action couldn't
+# find it at `bots/etf_rotation_v1/state.json` — every run started fresh.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 
 def default_state(paper_capital: float) -> Dict[str, Any]:

@@ -10,9 +10,13 @@ League Supabase project. This state file holds:
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict
 
-STATE_FILE = "state.json"
+# Anchor state.json to THIS file's directory rather than the process cwd.
+# Same fix as etf_rotation_v1/state.py — without this, the workflow cache
+# can't find the state file at `bots/short_watchlist_v1/state.json`.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 
 def default_state(capital_per_trade: float) -> Dict[str, Any]:
