@@ -1,0 +1,3 @@
+# bots/short_watchlist_v1 — runtime deps. Same lean set as the others.
+requests
+python-dotenv

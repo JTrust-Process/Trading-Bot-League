@@ -1,0 +1,61 @@
+name: Short Watchlist v1 (paper)
+
+on:
+  schedule:
+    # Hourly during US market hours, Mon-Fri.
+    # Offset minute :41 to avoid colliding with stock (:17), crypto
+    # (:07/:22/:37/:52), etf (:33), bond (:35), league_health (:09/:24/:39/:54).
+    - cron: "41 14-20 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: short-watchlist-v1
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
+
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+      LEAGUE_BOT_ID: "short_watchlist_v1"
+
+      SHORT_CAPITAL_PER_TRADE: "100"
+      SHORT_BARS_PERIOD: "YEAR"
+
+      TZ: "America/New_York"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: bots/short_watchlist_v1/state.json
+          key: short-watchlist-v1-state-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            short-watchlist-v1-state-${{ github.ref_name }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r bots/short_watchlist_v1/requirements.txt
+
+      - name: Run cycle
+        run: python -m bots.short_watchlist_v1.main
+
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bots/short_watchlist_v1/state.json
+          key: short-watchlist-v1-state-${{ github.ref_name }}-${{ github.run_id }}

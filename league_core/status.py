@@ -467,6 +467,52 @@ def _get_open_position(cfg: dict[str, str], symbol: str) -> Optional[dict[str, A
     return None
 
 
+def log_signal(
+    signal_type: str,
+    *,
+    symbol: Optional[str] = None,
+    asset_class: Optional[str] = None,
+    direction: Optional[str] = None,
+    confidence: Optional[float] = None,
+    suggested_size_usd: Optional[float] = None,
+    rationale: Optional[str] = None,
+    source: Optional[str] = None,
+    approval_required: bool = False,
+    metadata: Optional[dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+) -> None:
+    """Insert a row into bot_signals. Fail-silent.
+
+    direction must be one of: 'LONG' | 'SHORT' | 'NEUTRAL' | 'EXIT' or None.
+    asset_class must match the CHECK constraint when supplied.
+
+    Writing a signal does NOT execute anything. It's purely informational —
+    a human or another bot may later read it and decide to act.
+    """
+    cfg = _config()
+    if cfg is None:
+        return
+    if direction is not None and direction not in ("LONG", "SHORT", "NEUTRAL", "EXIT"):
+        _print(f"log_signal: invalid direction={direction!r}; writing as null")
+        direction = None
+    row: dict[str, Any] = {
+        "bot_id":             cfg["bot_id"],
+        "run_id":              run_id,
+        "generated_at":        _now_iso(),
+        "symbol":              symbol,
+        "asset_class":         asset_class,
+        "signal_type":         signal_type,
+        "direction":           direction,
+        "confidence":          confidence,
+        "suggested_size_usd":  suggested_size_usd,
+        "rationale":           rationale,
+        "source":              source,
+        "approval_required":   bool(approval_required),
+        "metadata":            metadata or {},
+    }
+    _post(cfg, "bot_signals", [row], upsert=False)
+
+
 def log_research_score(
     symbol: str,
     asset_class: str,
@@ -518,4 +564,5 @@ __all__ = [
     "upsert_position",
     "close_position",
     "log_research_score",
+    "log_signal",
 ]
