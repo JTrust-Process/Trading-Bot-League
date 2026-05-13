@@ -467,6 +467,58 @@ def _get_open_position(cfg: dict[str, str], symbol: str) -> Optional[dict[str, A
     return None
 
 
+def request_approval(
+    action: str,
+    *,
+    symbol: Optional[str] = None,
+    payload: Optional[dict[str, Any]] = None,
+    signal_id: Optional[str] = None,
+    expires_in_minutes: Optional[int] = None,
+    run_id: Optional[str] = None,
+) -> Optional[str]:
+    """Insert a pending row into bot_approvals. Fail-silent. Returns the
+    new approval id on success, None otherwise.
+
+    Writing here does NOT execute anything. The dashboard's pending-
+    approvals queue shows the row; a human Approve / Reject is what
+    flips it to status='approved' (and a downstream execution bot only
+    consumes 'approved' rows and flips them to 'consumed' after acting).
+
+    action: short verb like 'BUY', 'SELL', 'SHORT', 'COVER',
+            'OPTION_OPEN', 'OPTION_CLOSE'. Used by the dashboard for
+            display and by future execution bots for routing.
+    payload: full proposed order parameters as JSON.
+    signal_id: optional link back to bot_signals.id.
+    expires_in_minutes: if set, the row auto-expires for execution purposes
+                        after this many minutes from now (the bot consumer
+                        checks expires_at; the DB doesn't enforce it).
+    """
+    cfg = _config()
+    if cfg is None:
+        return None
+    expires_at: Optional[str] = None
+    if expires_in_minutes is not None and expires_in_minutes > 0:
+        from datetime import datetime, timedelta, timezone
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(minutes=int(expires_in_minutes))
+        ).isoformat()
+    row: dict[str, Any] = {
+        "bot_id":       cfg["bot_id"],
+        "signal_id":    signal_id,
+        "requested_at": _now_iso(),
+        "expires_at":   expires_at,
+        "action":       action,
+        "symbol":       symbol,
+        "payload":      payload or {},
+        "status":       "pending",
+    }
+    rows = _post(cfg, "bot_approvals", [row], return_representation=True)
+    if rows and isinstance(rows, list) and isinstance(rows[0], dict):
+        ap_id = rows[0].get("id")
+        return str(ap_id) if ap_id is not None else None
+    return None
+
+
 def log_signal(
     signal_type: str,
     *,
@@ -565,4 +617,5 @@ __all__ = [
     "close_position",
     "log_research_score",
     "log_signal",
+    "request_approval",
 ]
