@@ -38,7 +38,12 @@ UNIVERSE = (
 
 # Vol buckets
 VOL_WINDOW             = 21        # ~1 month of trading days
-VOL_BASELINE_WINDOW    = 252       # ~1 year
+VOL_BASELINE_WINDOW    = 200       # ~10 months. Was 252 (~1yr) but Public's
+                                   # `period=YEAR` returns ~252 bars and the vol
+                                   # helper needs lookback+1, so 252 was 1 bar
+                                   # short for every symbol. 200 is comfortably
+                                   # under the cap and produces an essentially
+                                   # identical regime classification.
 VOL_LOW_RATIO          = 0.70
 VOL_HIGH_RATIO         = 1.50
 
@@ -67,8 +72,13 @@ def _sma(values: List[float], period: int) -> Optional[float]:
 
 
 def _annualized_vol(values: List[float], lookback: int) -> Optional[float]:
+    # Defensive clamp: if we have fewer than lookback+1 bars but still
+    # enough for a meaningful stdev, shrink the window. Mirrors the
+    # bond bot's helper. Returns None only if we have < 6 closes total.
     if len(values) < lookback + 1:
-        return None
+        lookback = max(20, len(values) - 1)
+        if lookback < 5:
+            return None
     series = values[-(lookback + 1):]
     rets: List[float] = []
     for i in range(1, len(series)):

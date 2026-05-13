@@ -11,7 +11,8 @@ Each cycle, for every symbol in the universe:
 1. Fetches daily bars from Public.
 2. Derives **trend regime** (`bull` / `bear` / `mixed`) from close vs SMA50 / SMA200.
 3. Derives **volatility regime** (`low_vol` / `mid_vol` / `high_vol`) by
-   comparing realized vol over the last 21 days to the 1-year baseline.
+   comparing realized vol over the last 21 days to a ~10-month baseline
+   (200 trading days — comfortably under Public's `YEAR` return of ~252 bars).
 4. Maps the (trend × vol) combination to a single recommended strategy
    family from a 3 × 3 matrix.
 5. Writes one `options_idea` signal per symbol with rationale, confidence,
