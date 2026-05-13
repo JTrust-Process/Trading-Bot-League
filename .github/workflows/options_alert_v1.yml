@@ -1,0 +1,45 @@
+name: Options Alert v1 (research-only)
+
+on:
+  schedule:
+    # Once per day at 14:37 UTC. Daily-bar inputs only refresh daily.
+    # Offset minute :37 to avoid collisions with stock (:17), crypto
+    # (:07/:22/:37/:52)... actually crypto runs at :37, so let's pick :43.
+    - cron: "43 14 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: options-alert-v1
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      PUBLIC_SECRET: ${{ secrets.PUBLIC_SECRET }}
+
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+      LEAGUE_BOT_ID: "options_alert_v1"
+
+      OPTIONS_BARS_PERIOD: "YEAR"
+
+      TZ: "America/New_York"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r bots/options_alert_v1/requirements.txt
+
+      - name: Run scanner
+        run: python -m bots.options_alert_v1.main

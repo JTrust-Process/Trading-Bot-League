@@ -1,0 +1,3 @@
+# bots/options_alert_v1 — runtime deps. Same lean set as the other research bots.
+requests
+python-dotenv
