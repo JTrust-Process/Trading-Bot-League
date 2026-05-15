@@ -1,0 +1,50 @@
+name: Agent Research v1 (AI, research-only)
+
+on:
+  schedule:
+    # Once per day at 14:50 UTC (10:50 ET during EDT). Runs after the
+    # other research bots (bond at :35, options at :43) so the agent's
+    # snapshot includes their latest output.
+    # Offset minute :50 to avoid every other cron slot in use:
+    #  :07/:22/:37/:52 crypto, :09/:24/:39/:54 league_health,
+    #  :17 stock, :33 etf, :35 bond, :41 short, :43 options.
+    - cron: "50 14 * * 1-5"
+  workflow_dispatch: {}
+
+concurrency:
+  group: agent-research-v1
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      LEAGUE_SUPABASE_URL: ${{ secrets.LEAGUE_SUPABASE_URL }}
+      LEAGUE_SUPABASE_KEY: ${{ secrets.LEAGUE_SUPABASE_KEY }}
+      LEAGUE_BOT_ID: "agent_research_v1"
+
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Optional — defaults applied in code if absent
+      # AGENT_MODEL: "claude-haiku-4-5-20251001"
+      # AGENT_MAX_PROPOSALS: "3"
+
+      TZ: "America/New_York"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r bots/agent_research_v1/requirements.txt
+
+      - name: Run cycle
+        run: python -m bots.agent_research_v1.main

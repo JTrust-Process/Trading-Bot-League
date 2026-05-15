@@ -1,0 +1,5 @@
+# bots/agent_research_v1 — runtime deps. No `anthropic` package — we hit
+# the /v1/messages endpoint directly via requests to keep the dep set
+# identical to the other League bots.
+requests
+python-dotenv
