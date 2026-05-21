@@ -27,6 +27,14 @@ COPY bots/         /app/bots/
 COPY league_core/  /app/league_core/
 COPY scripts/      /app/scripts/
 
+# COPY runs as root, so /app/ is owned by root and not writable by the
+# `app` user. Bots and league_health write state files next to their
+# source (e.g., /app/bots/etf_rotation_v1/state.json, /app/scripts/...).
+# Without this chown, every state write hits PermissionError(13) and the
+# bot cycle fails partway through. Take ownership so the runtime user
+# can read AND write.
+RUN chown -R app:app /app
+
 # state.json files for stateful bots live next to their main.py, which is
 # fine for our single-process scheduler — they persist across job runs as
 # long as the container stays up. On container restart they reset; the
