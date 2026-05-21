@@ -216,8 +216,16 @@ def _print_startup_banner(sched: BlockingScheduler) -> None:
     log.info("python: %s", sys.version.split()[0])
     log.info("repo root: %s", _ROOT)
     log.info("jobs scheduled:")
+    now = datetime.now(timezone.utc)
     for j in sched.get_jobs():
-        log.info("  %-26s next=%s  trigger=%s", j.id, j.next_run_time, j.trigger)
+        # next_run_time is only computed after sched.start() — pre-start
+        # jobs are "tentative" and don't have it set. Compute it from the
+        # trigger directly so the banner is informative either way.
+        try:
+            next_fire = j.trigger.get_next_fire_time(None, now)
+        except Exception:
+            next_fire = None
+        log.info("  %-26s next=%s  trigger=%s", j.id, next_fire, j.trigger)
     log.info("=" * 60)
 
 
