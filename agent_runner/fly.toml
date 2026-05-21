@@ -1,0 +1,51 @@
+# fly.toml — Fly.io deploy config for the agent_runner service.
+#
+# Deploy from the REPO ROOT (one level above this file) with:
+#
+#     fly launch --copy-config --config agent_runner/fly.toml --no-deploy
+#     # → answer the prompts; do NOT create a Postgres or Redis
+#     fly secrets set \
+#       LEAGUE_SUPABASE_URL=... \
+#       LEAGUE_SUPABASE_KEY=... \
+#       LEAGUE_SUPABASE_ANON_KEY=... \
+#       LEAGUE_DISCORD_WEBHOOK_URL=... \
+#       PUBLIC_SECRET=... \
+#       ANTHROPIC_API_KEY=...
+#     fly deploy --config agent_runner/fly.toml
+#
+# After deploy, tail logs with:
+#     fly logs --config agent_runner/fly.toml
+
+app = "trading-bot-league-agent-runner"   # change to your unique app name
+primary_region = "iad"                     # Northern Virginia — close to NYSE/Public
+
+# Build from the agent_runner/Dockerfile, with the build context at the
+# repo root (one level up) so COPY paths in the Dockerfile resolve.
+[build]
+  dockerfile = "agent_runner/Dockerfile"
+
+# No HTTP service — the scheduler is a pure background worker. We don't
+# expose any inbound ports. Fly will keep the machine running on the
+# always-on plan because there's no autostop=true here.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[deploy]
+  # Single machine, never scale to zero — we need the scheduler awake.
+  strategy = "immediate"
+
+[processes]
+  app = "python -m agent_runner.scheduler"
+
+# Notes:
+# - shared-cpu-1x at 256MB is the smallest VM Fly offers. Our service
+#   idles at ~80MB and spikes briefly to ~150MB during bot cycles. Fine.
+# - Cost: Fly's pay-as-you-go puts a shared-cpu-1x 256MB always-on
+#   machine at ~$1.94-$2.02/month. New accounts get a ONE-TIME $5
+#   trial credit (Fly killed the permanent free tier in Oct 2024), so
+#   first ~2.5 months are effectively free, then ~$2/month ongoing.
+#   Set a Fly billing alert at $5/mo so anomalies ping you early.
+# - No volumes — bot state.json files live in the container filesystem,
+#   which is recreated on each deploy. On restart, the bots self-heal
+#   (regime is re-derived from bars; positions are read from Supabase).

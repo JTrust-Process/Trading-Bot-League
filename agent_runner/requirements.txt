@@ -1,0 +1,9 @@
+# agent_runner — runtime deps.
+#
+# Superset of every bot's requirements + APScheduler. The bots' own
+# requirements.txt files stay separate so each can still be installed
+# in isolation when run as `python -m bots.<name>.main` outside the
+# agent_runner.
+apscheduler>=3.10,<4.0
+requests
+python-dotenv

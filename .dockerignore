@@ -1,0 +1,48 @@
+# Lives at the REPO ROOT because the Dockerfile's build context is the
+# repo root (set in fly.toml via `[build] dockerfile = "agent_runner/Dockerfile"`).
+
+# Secrets — never bake into images
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Python local artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# State files — they live in the image's working dir at runtime, but we
+# don't ship them from local. The bots write fresh ones in the container.
+**/state.json
+**/status_state.json
+
+# Documentation / config we don't need in the runtime image
+PLAN.md
+README.md
+*.md
+
+# GHA workflows — not needed at runtime
+.github/
+
+# Supabase migrations & seeds — applied via SQL editor, not at runtime
+supabase/
+
+# CI / build artifacts
+*.log
+*.csv
