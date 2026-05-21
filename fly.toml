@@ -1,0 +1,51 @@
+# fly.toml — Fly.io deploy config for the agent_runner service.
+#
+# This file lives at the REPO ROOT (not inside agent_runner/) so that
+# Fly's default build context — the directory containing fly.toml — is
+# the repo root. The Dockerfile needs to COPY from bots/, league_core/,
+# and scripts/, which all live at the repo root.
+#
+# Deploy from the REPO ROOT with:
+#
+#     fly deploy
+#     # → builds the image from this directory using agent_runner/Dockerfile
+#
+# After deploy, tail logs with:
+#     fly logs
+#
+# To set or rotate secrets:
+#     fly secrets set FOO='...' BAR='...'
+
+app = 'trading-bot-league-agent-runner'
+primary_region = 'iad'
+
+# Build from agent_runner/Dockerfile. Build context is this directory
+# (the repo root) by default since fly.toml lives here.
+[build]
+  dockerfile = 'agent_runner/Dockerfile'
+
+# No HTTP service — the scheduler is a pure background worker. We don't
+# expose any inbound ports. Fly will keep the machine running because
+# there's no autostop=true here.
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+
+[deploy]
+  # Single machine, never scale to zero — we need the scheduler awake.
+  strategy = 'immediate'
+
+[processes]
+  app = 'python -m agent_runner.scheduler'
+
+# Notes:
+# - shared-cpu-1x at 256MB is the smallest VM Fly offers. Our service
+#   idles at ~80MB and spikes briefly to ~150MB during bot cycles. Fine.
+# - Cost: Fly's pay-as-you-go puts a shared-cpu-1x 256MB always-on
+#   machine at ~$1.94-$2.02/month. New accounts get a ONE-TIME $5
+#   trial credit (Fly killed the permanent free tier in Oct 2024), so
+#   first ~2.5 months are effectively free, then ~$2/month ongoing.
+#   Set a Fly billing alert at $5/mo so anomalies ping you early.
+# - No volumes — bot state.json files live in the container filesystem,
+#   which is recreated on each deploy. On restart, the bots self-heal
+#   (regime is re-derived from bars; positions are read from Supabase).

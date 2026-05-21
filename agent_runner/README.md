@@ -86,14 +86,19 @@ python -m bots.etf_rotation_v1.main
 
 ## Deploy to Fly.io
 
-One-time setup:
+**Important**: `fly.toml` lives at the **repo root**, NOT inside
+`agent_runner/`. Fly's CLI insists on treating fly.toml's directory as
+the build context, and we need the build context to be the repo root so
+the Dockerfile can `COPY bots/`, `COPY league_core/`, and `COPY scripts/`.
+
+One-time setup, from the **repo root**:
 
 ```bash
 # Install flyctl: https://fly.io/docs/hands-on/install-flyctl/
 fly auth login
 
-# From the repo root:
-fly launch --copy-config --config agent_runner/fly.toml --no-deploy
+# Initialize the app (does not deploy):
+fly launch --copy-config --no-deploy
 ```
 
 When `fly launch` prompts:
@@ -103,7 +108,8 @@ When `fly launch` prompts:
 - Do NOT create a Postgres or Redis instance
 - Do NOT deploy yet
 
-Set the secrets:
+Set the secrets (PowerShell users: put it all on one line, or use
+backticks `` ` `` for line continuation instead of `\`):
 
 ```bash
 fly secrets set \
@@ -112,20 +118,19 @@ fly secrets set \
   LEAGUE_SUPABASE_ANON_KEY='eyJ...' \
   LEAGUE_DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...' \
   PUBLIC_SECRET='...' \
-  ANTHROPIC_API_KEY='sk-ant-api03-...' \
-  --config agent_runner/fly.toml
+  ANTHROPIC_API_KEY='sk-ant-api03-...'
 ```
 
 Then deploy:
 
 ```bash
-fly deploy --config agent_runner/fly.toml
+fly deploy
 ```
 
 Tail logs to confirm it's running:
 
 ```bash
-fly logs --config agent_runner/fly.toml
+fly logs
 ```
 
 You should see the startup banner listing all 6 jobs with their next-run
