@@ -1,0 +1,4 @@
+# public_shadow_v1 — runtime deps.
+# Read-only mirror of account 2's trade history into bot_trades.
+requests
+python-dotenv

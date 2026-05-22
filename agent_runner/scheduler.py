@@ -197,6 +197,17 @@ def build_scheduler() -> BlockingScheduler:
         id="short_watchlist_v1", name="short_watchlist_v1 (hourly mkt hrs)",
     )
 
+    # ── Shadow logger — every 10 min, 24/7 ──────────────────────────────────
+    # Polls Public account #2's trade history and mirrors new trades into
+    # bot_trades. Runs 24/7 because crypto trades can happen anytime, and
+    # because the cost of an extra poll cycle is essentially zero.
+    # No-op until PUBLIC_SECRET_ACCOUNT2 / PUBLIC_ACCOUNT_ID_ACCOUNT2 are set.
+    sched.add_job(
+        _run_bot, args=("public_shadow_v1", "bots.public_shadow_v1.main"),
+        trigger=CronTrigger.from_crontab("*/10 * * * *", timezone="UTC"),
+        id="public_shadow_v1", name="public_shadow_v1 (every 10 min)",
+    )
+
     # ── League health — every 15 min, 24/7 ──────────────────────────────────
     sched.add_job(
         _run_league_health,
