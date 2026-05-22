@@ -115,48 +115,51 @@ def run_cycle() -> int:
     Fail-silent: missing credentials = 0 (we want this deployable before
     account 2 is set up). API errors = 0 (try again next cycle).
     """
-    league.heartbeat("starting")
+    league.heartbeat("healthy")
     run_id = league.start_run(trigger="agent_runner")
 
     try:
-        secret_set = bool(os.getenv("PUBLIC_SECRET_ACCOUNT2"))
+        # Secret: prefer account-2-specific, fall back to the shared
+        # PUBLIC_SECRET (matches the fallback logic in api.get_access_token).
+        secret_set = bool(os.getenv("PUBLIC_SECRET_ACCOUNT2")
+                          or os.getenv("PUBLIC_SECRET"))
         account_set = bool(os.getenv("PUBLIC_ACCOUNT_ID_ACCOUNT2"))
         if not (secret_set and account_set):
             print("[public_shadow] credentials not yet configured "
                   f"(secret={secret_set}, account_id={account_set}); idle cycle")
-            league.heartbeat("idle")
-            league.end_run(status="success", trade_count=0,
-                           message="no credentials configured yet")
+            league.heartbeat("healthy")
+            league.end_run(run_id, status="success", trade_count=0,
+                           notes="no credentials configured yet")
             return 0
 
         history = api.fetch_history()
         if history is None:
             # Hard API error already logged; treat as a soft skip.
-            league.heartbeat("idle")
-            league.end_run(status="success", trade_count=0,
-                           message="api fetch failed; will retry next cycle")
+            league.heartbeat("degraded")
+            league.end_run(run_id, status="success", trade_count=0,
+                           notes="api fetch failed; will retry next cycle")
             return 0
 
         if not history:
             print("[public_shadow] no trades returned")
-            league.heartbeat("idle")
-            league.end_run(status="success", trade_count=0,
-                           message="no trades in history window")
+            league.heartbeat("healthy")
+            league.end_run(run_id, status="success", trade_count=0,
+                           notes="no trades in history window")
             return 0
 
         stats = _ingest_trades(history, run_id)
         print(f"[public_shadow] submitted={stats['submitted']} skipped={stats['skipped']}")
-        league.heartbeat("idle")
-        league.end_run(status="success",
+        league.heartbeat("healthy")
+        league.end_run(run_id, status="success",
                        trade_count=stats["submitted"],
-                       message=f"submitted={stats['submitted']} skipped={stats['skipped']}")
+                       notes=f"submitted={stats['submitted']} skipped={stats['skipped']}")
         return 0
 
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
-        league.heartbeat("idle")
-        league.end_run(status="failed", trade_count=0, error_count=1,
-                       message=f"exception: {e}")
+        league.heartbeat("down")
+        league.end_run(run_id, status="failed", trade_count=0, error_count=1,
+                       notes=f"exception: {e}")
         return 1
 
 
