@@ -436,6 +436,56 @@ def close_position(
     _patch(cfg, "bot_positions", f"id=eq.{existing['id']}", patch)
 
 
+def get_open_symbols(
+    asset_class: Optional[str] = None,
+    bot_id: Optional[str] = None,
+) -> Optional[list[str]]:
+    """Return sorted, uppercase list of symbols where this bot has an open
+    position. Returns None if the League isn't configured or the lookup
+    fails (caller should treat 'None' as 'state unknown'). Returns [] if
+    configured but no open positions exist.
+
+    asset_class: optional filter (e.g. 'etf') to scope to a single class.
+    bot_id:      defaults to LEAGUE_BOT_ID. Override only for ops scripts
+                 that want to peek at another bot's positions.
+
+    Designed for bots that want to derive `last_target_set`-style state
+    from the durable bot_positions table instead of a local file. The
+    etf_rotation_v1 phantom-trade incident (2026-05-21..22) was caused by
+    a file-based state.json being wiped on container restarts; switching
+    to this helper eliminates that whole class of bug.
+    """
+    cfg = _config()
+    if cfg is None or requests is None:
+        return None
+    target_bot_id = bot_id or cfg["bot_id"]
+    qs = f"bot_id=eq.{target_bot_id}&status=eq.open&select=symbol"
+    if asset_class:
+        qs += f"&asset_class=eq.{asset_class}"
+    url = f"{cfg['url']}/rest/v1/bot_positions?{qs}"
+    headers = {
+        "apikey": cfg["key"],
+        "Authorization": f"Bearer {cfg['key']}",
+        "Accept": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=5.0)
+    except Exception as e:  # noqa: BLE001
+        _print(f"GET bot_positions open-symbols failed: {e!r}")
+        return None
+    if resp.status_code >= 400:
+        _print(f"GET bot_positions open-symbols status={resp.status_code} "
+               f"body={resp.text[:200]}")
+        return None
+    try:
+        rows = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(rows, list):
+        return None
+    return sorted({str(r["symbol"]).upper() for r in rows if r.get("symbol")})
+
+
 def _get_open_position(cfg: dict[str, str], symbol: str) -> Optional[dict[str, Any]]:
     """Fetch the open bot_positions row for (bot_id, symbol) or None."""
     if requests is None:
@@ -615,6 +665,7 @@ __all__ = [
     "log_event",
     "upsert_position",
     "close_position",
+    "get_open_symbols",
     "log_research_score",
     "log_signal",
     "request_approval",
