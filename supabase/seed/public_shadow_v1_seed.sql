@@ -42,7 +42,7 @@ insert into public.bot_registry (
   'Public Shadow Logger (account 2)',
   'agent_research',  -- closest existing bot_type; we'd add 'shadow' later if needed
   'research',
-  'enabled',
+  'disabled',  -- DISABLED 2026-05-28: account #2 reassigned off-platform, MCP path dropped
   ARRAY[]::text[],  -- empty: shadow logger doesn't constrain instruments (read-only)
   false,    -- never places orders
   false,    -- no approvals — read-only
@@ -50,10 +50,12 @@ insert into public.bot_registry (
   0,
   0,
   'jeremiahallu13@gmail.com',
-  'Mirrors trades from Public brokerage account #2 into bot_trades under '
-    || 'virtual bot_ids (public_account2_v1 for v1). No order placement, '
-    || 'no risk of touching the live account. Polls every 10 min via '
-    || 'agent_runner.'
+  'DISABLED 2026-05-28. Originally mirrored trades from Public brokerage '
+    || 'account #2 into bot_trades under virtual bot_ids '
+    || '(public_account2_v1). Disabled because account #2 was reassigned '
+    || 'to an off-platform strategy and the Claude MCP path was dropped. '
+    || 'Bot code remains in repo for future revival; flip status back to '
+    || '''enabled'' and restore the scheduler job to re-activate.'
 )
 on conflict (bot_id) do update set
   bot_name                 = excluded.bot_name,
@@ -99,7 +101,7 @@ insert into public.bot_registry (
   'Public Account #2 (AI tools)',
   'agent_research',  -- bot_type that allows order placement; we set can_place_orders=false here anyway
   'live',
-  'enabled',
+  'disabled',  -- DISABLED 2026-05-28: account #2 reassigned off-platform; no shadow logger feeding it
   ARRAY[]::text[],  -- empty: AI tools can trade anything Public allows. Public enforces, not us.
   false,    -- the LOGGER doesn't place orders; AI tools do. From bot_registry's POV: false.
   false,

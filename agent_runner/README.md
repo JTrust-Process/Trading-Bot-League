@@ -14,8 +14,13 @@ GitHub Actions free minutes.
 | `agent_research_v1`   | weekday 14:50 UTC                              | `bots.agent_research_v1.main`   |
 | `etf_rotation_v1`     | weekday hourly 14-20 UTC at :33                | `bots.etf_rotation_v1.main`     |
 | `short_watchlist_v1`  | weekday hourly 14-20 UTC at :41                | `bots.short_watchlist_v1.main`  |
-| `public_shadow_v1`    | every 10 min, 24/7 (`*/10`)                    | `bots.public_shadow_v1.main`    |
 | `league_health`       | every 15 min, 24/7 (`:09/:24/:39/:54`)         | `scripts.league_health.main`    |
+
+`public_shadow_v1` was previously scheduled every 10 min, 24/7. It was
+disabled 2026-05-28 (account #2 reassigned off-platform; Claude MCP path
+dropped). Bot code remains in `bots/public_shadow_v1/` for future revival;
+to re-enable, restore the `add_job` block in `scheduler.py` from git
+history and flip `bot_registry.status` back to `'enabled'`.
 
 ## What does NOT run here
 
