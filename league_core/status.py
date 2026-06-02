@@ -436,6 +436,48 @@ def close_position(
     _patch(cfg, "bot_positions", f"id=eq.{existing['id']}", patch)
 
 
+def get_bot_mode(bot_id: Optional[str] = None) -> str:
+    """Return this bot's `mode` from bot_registry. Defaults to 'paper' on
+    any failure — the SAFE default (no real-money code path).
+
+    Used by bots that need to branch on mode at the top of a cycle (paper
+    vs live). The risk gate (league_core.risk) also checks mode, so this
+    is a convenience early-exit signal for the bot to pick its code path,
+    NOT a security boundary. The actual guarantee lives in risk.preflight.
+
+    bot_id: defaults to LEAGUE_BOT_ID. Override only for ops scripts.
+    """
+    cfg = _config()
+    if cfg is None or requests is None:
+        return "paper"
+    target_bot_id = bot_id or cfg["bot_id"]
+    url = (
+        f"{cfg['url']}/rest/v1/bot_registry"
+        f"?bot_id=eq.{target_bot_id}&select=mode&limit=1"
+    )
+    headers = {
+        "apikey": cfg["key"],
+        "Authorization": f"Bearer {cfg['key']}",
+        "Accept": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=5.0)
+    except Exception:  # noqa: BLE001
+        return "paper"
+    if resp.status_code >= 400:
+        return "paper"
+    try:
+        rows = resp.json()
+    except Exception:  # noqa: BLE001
+        return "paper"
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return "paper"
+    mode = rows[0].get("mode")
+    if not isinstance(mode, str):
+        return "paper"
+    return mode.lower()
+
+
 def get_open_symbols(
     asset_class: Optional[str] = None,
     bot_id: Optional[str] = None,
@@ -666,6 +708,7 @@ __all__ = [
     "upsert_position",
     "close_position",
     "get_open_symbols",
+    "get_bot_mode",
     "log_research_score",
     "log_signal",
     "request_approval",

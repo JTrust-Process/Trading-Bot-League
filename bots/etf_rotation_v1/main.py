@@ -43,6 +43,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from league_core import status as league
+from league_core import risk
+from league_core.public_api import equities
 from league_core.public_bars import get_public_bars, latest_close
 from bots.etf_rotation_v1 import strategy
 from bots.etf_rotation_v1 import state as bot_state
@@ -154,6 +156,169 @@ def _open_position(
     return qty
 
 
+# ── Live order helpers ──────────────────────────────────────────────────────
+#
+# Used only when bot_registry.mode='live'. Each wraps:
+#   1. risk.preflight()              — refusal logs RISK_REFUSED, returns None
+#   2. equities.place_market_*()     — failures log ORDER_FAILED, return None
+#   3. equities.get_fill_price()     — None fallback to bar close (estimated)
+#   4. league.log_trade + position   — write the resulting REAL trade row
+#
+# Dry-run semantics: when PUBLIC_DRY_RUN=1 is set, equities returns a fake
+# success with response.dry_run=true. We propagate that through to
+# metadata.dry_run so dashboards/queries can filter it out separately from
+# paper trades. The bot still updates bot_positions as if the order filled
+# so subsequent cycles see consistent state — the same pattern as paper.
+
+
+def _live_open_position(
+    run_id: Optional[str],
+    symbol: str,
+    dollars: float,
+    fallback_price: float,
+    reason: str,
+) -> Optional[float]:
+    """Place a real market BUY for `dollars` of `symbol`. Returns qty on
+    success, None if risk refused or the order failed.
+
+    fallback_price is the bar close — used to compute qty when fill
+    discovery returns None (rare for market orders during market hours,
+    common in dry-run mode where no real order exists)."""
+    ok, reason_code = risk.preflight(action="BUY", symbol=symbol, amount_usd=dollars)
+    if not ok:
+        league.log_event(
+            "RISK_REFUSED", symbol=symbol, message=reason_code,
+            metadata={"action": "BUY", "amount_usd": dollars}, run_id=run_id,
+        )
+        print(f"[etf]   BUY {symbol} refused by risk: {reason_code}")
+        return None
+
+    result = equities.place_market_buy(symbol, dollars)
+    if not result["ok"]:
+        league.log_event(
+            "ORDER_FAILED", symbol=symbol,
+            message=str(result.get("error") or "unknown"),
+            metadata={
+                "action":      "BUY",
+                "order_id":    result.get("order_id"),
+                "status_code": result.get("status_code"),
+            },
+            run_id=run_id,
+        )
+        print(f"[etf]   BUY {symbol} order failed: {result.get('error')}")
+        return None
+
+    order_id = result["order_id"]
+    is_dry = bool((result.get("response") or {}).get("dry_run"))
+
+    # Fill discovery — skip for dry-run since no real order exists.
+    fill_price: Optional[float] = None
+    if not is_dry:
+        fill_price = equities.get_fill_price(order_id)
+    estimated = fill_price is None
+    if estimated:
+        fill_price = fallback_price
+    if not fill_price or fill_price <= 0:
+        league.log_event(
+            "ORDER_FAILED", symbol=symbol,
+            message="no_fill_price_and_no_fallback",
+            metadata={"order_id": order_id}, run_id=run_id,
+        )
+        return None
+
+    qty = dollars / fill_price
+
+    league.log_trade(
+        symbol=symbol, side="BUY", asset_class="etf",
+        quantity=qty, price=fill_price, amount_usd=dollars,
+        reason=reason, strategy="etf_rotation_v1",
+        is_paper=False, order_id=order_id, run_id=run_id,
+        metadata={
+            "fill_price_estimated": estimated,
+            "dry_run":              is_dry,
+        },
+    )
+    league.upsert_position(
+        symbol=symbol, asset_class="etf", status="open",
+        quantity=qty, entry_price=fill_price, entry_at=_utcnow_iso(),
+        amount_usd=dollars, is_paper=False,
+        metadata={"dry_run": True} if is_dry else None,
+    )
+    return qty
+
+
+def _live_close_position(
+    run_id: Optional[str],
+    symbol: str,
+    qty: float,
+    entry_price: float,
+    fallback_exit_price: float,
+    reason: str,
+) -> Optional[Tuple[float, float]]:
+    """Place a real market SELL of `qty` shares of `symbol`. Returns
+    (pnl_usd, pnl_pct) on success, None if risk refused or order failed."""
+    notional_for_risk = float(qty) * float(fallback_exit_price)
+    ok, reason_code = risk.preflight(action="SELL", symbol=symbol,
+                                     amount_usd=notional_for_risk)
+    if not ok:
+        league.log_event(
+            "RISK_REFUSED", symbol=symbol, message=reason_code,
+            metadata={"action": "SELL", "quantity": qty}, run_id=run_id,
+        )
+        print(f"[etf]   SELL {symbol} refused by risk: {reason_code}")
+        return None
+
+    result = equities.place_market_sell(symbol, qty)
+    if not result["ok"]:
+        league.log_event(
+            "ORDER_FAILED", symbol=symbol,
+            message=str(result.get("error") or "unknown"),
+            metadata={
+                "action":      "SELL",
+                "order_id":    result.get("order_id"),
+                "status_code": result.get("status_code"),
+            },
+            run_id=run_id,
+        )
+        print(f"[etf]   SELL {symbol} order failed: {result.get('error')}")
+        return None
+
+    order_id = result["order_id"]
+    is_dry = bool((result.get("response") or {}).get("dry_run"))
+
+    exit_price: Optional[float] = None
+    if not is_dry:
+        exit_price = equities.get_fill_price(order_id)
+    estimated = exit_price is None
+    if estimated:
+        exit_price = fallback_exit_price
+
+    if exit_price and entry_price > 0:
+        pnl_usd = (exit_price - entry_price) * qty
+        pnl_pct = (exit_price / entry_price) - 1.0
+    else:
+        pnl_usd = 0.0
+        pnl_pct = 0.0
+
+    league.log_trade(
+        symbol=symbol, side="SELL", asset_class="etf",
+        quantity=qty, price=exit_price,
+        amount_usd=(exit_price or 0.0) * qty,
+        pnl_usd=pnl_usd, pnl_pct=pnl_pct,
+        reason=reason, strategy="etf_rotation_v1",
+        is_paper=False, order_id=order_id, run_id=run_id,
+        metadata={
+            "fill_price_estimated": estimated,
+            "dry_run":              is_dry,
+        },
+    )
+    league.close_position(
+        symbol=symbol, exit_price=exit_price, exit_at=_utcnow_iso(),
+        pnl_usd=pnl_usd, pnl_pct=pnl_pct, close_reason=reason,
+    )
+    return (pnl_usd, pnl_pct)
+
+
 # ── Core ────────────────────────────────────────────────────────────────────
 
 
@@ -166,6 +331,11 @@ def run_cycle() -> str:
     s = bot_state.load_state(default_capital=PAPER_CAPITAL_DEFAULT)
     print(f"[etf] state loaded: last_target={s['last_target_set']!r} "
           f"capital=${s['paper_capital']:.2f}")
+
+    # Read mode FIRST. Defaults to 'paper' on any lookup failure (safe
+    # fallback — never accidentally trade real money if registry is unreachable).
+    mode = league.get_bot_mode()
+    print(f"[etf] mode={mode}")
 
     run_id = league.start_run("cron")
     print(f"[etf] league run_id={run_id}")
@@ -241,32 +411,59 @@ def run_cycle() -> str:
         for sym in to_close:
             price = _fetch_close(sym)
             if price is None:
-                print(f"[etf]   close {sym}: price unavailable; recording exit without PnL")
-                league.close_position(symbol=sym, close_reason="regime_change_no_price")
-                trade_count += 1
+                if mode == "live":
+                    league.log_event(
+                        "PRICE_UNAVAILABLE", symbol=sym,
+                        message="cannot fetch latest close; skipping live SELL",
+                        run_id=run_id,
+                    )
+                    error_count += 1
+                else:
+                    print(f"[etf]   close {sym}: price unavailable; recording exit without PnL")
+                    league.close_position(symbol=sym, close_reason="regime_change_no_price")
+                    trade_count += 1
                 continue
             # We need entry/quantity to compute pnl; pull it via the internal helper.
-            # Falling back to close_position-without-pnl if not found.
             cfg = league._config()  # noqa: SLF001 - intentional reuse
             pos = league._get_open_position(cfg, sym) if cfg else None  # noqa: SLF001
             if pos and pos.get("quantity") and pos.get("entry_price"):
-                pnl_usd, pnl_pct = _close_position(
-                    run_id, sym,
-                    qty=float(pos["quantity"]),
-                    entry_price=float(pos["entry_price"]),
-                    exit_price=price,
-                    reason="regime_change",
-                )
+                qty = float(pos["quantity"])
+                entry_price = float(pos["entry_price"])
+                if mode == "live":
+                    result = _live_close_position(
+                        run_id, sym, qty, entry_price, price,
+                        reason="regime_change",
+                    )
+                    if result is None:
+                        # risk refused or order failed — already logged, count as error.
+                        error_count += 1
+                        continue
+                    pnl_usd, pnl_pct = result
+                else:
+                    pnl_usd, pnl_pct = _close_position(
+                        run_id, sym, qty=qty, entry_price=entry_price,
+                        exit_price=price, reason="regime_change",
+                    )
                 print(f"[etf]   close {sym} @ {price:.2f} pnl=${pnl_usd:.2f} ({pnl_pct*100:+.2f}%)")
+                trade_count += 1
             else:
-                # No prior open row found — just record the close attempt.
-                league.log_trade(
-                    symbol=sym, side="SELL", asset_class="etf",
-                    price=price, reason="regime_change_no_prior_position",
-                    strategy="etf_rotation_v1", is_paper=True, run_id=run_id,
-                )
-                print(f"[etf]   close {sym} @ {price:.2f} (no prior open row)")
-            trade_count += 1
+                # No prior open row found.
+                if mode == "live":
+                    # Can't sell what we don't track. Surface the inconsistency.
+                    league.log_event(
+                        "NO_PRIOR_POSITION", symbol=sym,
+                        message="no open bot_position row to SELL against; skipping live exit",
+                        run_id=run_id,
+                    )
+                    error_count += 1
+                else:
+                    league.log_trade(
+                        symbol=sym, side="SELL", asset_class="etf",
+                        price=price, reason="regime_change_no_prior_position",
+                        strategy="etf_rotation_v1", is_paper=True, run_id=run_id,
+                    )
+                    print(f"[etf]   close {sym} @ {price:.2f} (no prior open row)")
+                    trade_count += 1
 
         # Step 2: open each new-target symbol with an equal share of capital.
         per_symbol = s["paper_capital"] / float(len(target_set)) if target_set else 0.0
@@ -276,7 +473,17 @@ def run_cycle() -> str:
                 print(f"[etf]   open {sym}: price unavailable; skipping")
                 error_count += 1
                 continue
-            qty = _open_position(run_id, sym, per_symbol, price, reason="regime_change")
+            if mode == "live":
+                qty = _live_open_position(
+                    run_id, sym, per_symbol, price, reason="regime_change",
+                )
+                if qty is None:
+                    error_count += 1
+                    continue
+            else:
+                qty = _open_position(
+                    run_id, sym, per_symbol, price, reason="regime_change",
+                )
             print(f"[etf]   open  {sym} ${per_symbol:.2f} -> {qty:.6f} units @ {price:.2f}")
             trade_count += 1
 

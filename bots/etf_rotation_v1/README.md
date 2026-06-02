@@ -1,6 +1,13 @@
 # etf_rotation_v1
 
-**Paper-only** ETF rotation bot. Never places real orders.
+ETF rotation bot. Mode-aware: when `bot_registry.mode = 'paper'` (the
+default) it simulates fills exactly as before; when `mode = 'live'` it
+places real Public.com market orders via `league_core.public_api.equities`
+after going through the `league_core.risk` preflight gate.
+
+`mode` is read from Supabase at the start of every cycle, so flipping
+paper ↔ live is a SQL update (no redeploy required). On any registry
+lookup failure the bot defaults to `paper` — the safe fallback.
 
 ## Strategy
 
@@ -20,27 +27,46 @@ That's the entire strategy. Intentionally tiny.
 
 ## What it writes (all in the League Supabase project)
 
-- `bot_runs`            — one row per cycle (via `league_status.start_run` / `end_run`).
-- `bot_status`          — single row keyed by `bot_id`, upserted.
-- `bot_events`          — REGIME_CHECK every cycle, REGIME_CHANGE on rebalance.
-- `bot_trades`          — one row per simulated BUY/SELL, `is_paper=True`, `asset_class='etf'`.
-- `bot_positions`       — open / closed paper positions. Unique partial index on `(bot_id, symbol)` where `status='open'` keeps the table consistent.
+- `bot_runs`        — one row per cycle.
+- `bot_status`      — single row keyed by `bot_id`, upserted.
+- `bot_events`      — `REGIME_CHECK` every cycle, `REGIME_CHANGE` on rebalance.
+                       In live mode, also `RISK_REFUSED` / `ORDER_FAILED` /
+                       `PRICE_UNAVAILABLE` / `NO_PRIOR_POSITION` when the
+                       respective edge cases fire.
+- `bot_trades`      — one row per BUY/SELL. `asset_class='etf'`.
+                       In paper mode: `is_paper=True`.
+                       In live mode: `is_paper=False`, `order_id` set to the
+                       deterministic Public order id, `metadata.dry_run`
+                       flagged when `PUBLIC_DRY_RUN=1`,
+                       `metadata.fill_price_estimated=true` when fill
+                       discovery fell back to the bar close.
+- `bot_positions`   — open / closed positions. Same partial unique index on
+                       `(bot_id, symbol)` where `status='open'` regardless
+                       of mode.
 
 ## What it never writes
 
-- Real Public orders. The order endpoint is not imported anywhere in this bot.
-- The Stock or Crypto bot's existing Supabase projects.
+- The Stock or Crypto bot's existing Supabase projects (they live in
+  separate Supabase projects altogether).
+- Real Public orders WHEN `mode='paper'`. The live path is taken only
+  when `bot_registry.mode='live'` for this `bot_id`. The risk gate
+  (`league_core.risk.preflight`) is the architectural guarantee — even
+  if the order client were called by mistake, preflight would refuse
+  with `REASON_MODE_NOT_LIVE`.
 
 ## Environment variables
 
 | Var | Default | Description |
 |---|---|---|
-| `PUBLIC_SECRET`            |  | Public.com API secret. Required to fetch bars. |
+| `PUBLIC_SECRET`            |  | Public.com API secret. Required to fetch bars AND to place live orders. |
+| `PUBLIC_ACCOUNT_ID`        |  | Optional in paper mode. **Required** in live mode — explicit pin of which Public account to trade against. Without it, the auth helper would fall back to the first account, which is risky if you have more than one. |
 | `LEAGUE_SUPABASE_URL`      |  | League Supabase project URL. |
 | `LEAGUE_SUPABASE_KEY`      |  | League **service-role** key (writes need RLS bypass). |
 | `LEAGUE_BOT_ID`            |  | Must equal `etf_rotation_v1` so writes attribute correctly. |
-| `ETF_PAPER_CAPITAL`        | `1000` | Paper starting capital ($). Used only to size new positions on each rebalance. |
+| `ETF_PAPER_CAPITAL`        | `1000` | Per-cycle total notional ($). Despite the name (kept for back-compat with paper-only history), this is the sizing reference in BOTH modes: each new position gets `ETF_PAPER_CAPITAL / N` of capital. Set low (e.g. `100`) for first live cycles. |
 | `ETF_BARS_PERIOD`          | `YEAR` | Period passed to Public's bars endpoint. `YEAR` ≈ 252 daily bars — enough for SMA(50). |
+| `PUBLIC_DRY_RUN`           |  | Optional. When `1` / `true`, the order client returns synthetic success without calling Public. Recommended for the FIRST live cycle: set this, watch the cycle log the would-be payloads, then unset it for actual order placement. |
+| `LEAGUE_KILL`              |  | Global kill switch. When `1` / `true`, every `risk.preflight()` call refuses with `REASON_KILL_GLOBAL`. Flippable on Fly via `fly secrets set LEAGUE_KILL=1`. |
 
 ## Schedule
 
@@ -85,15 +111,27 @@ change) `bot_trades` + `bot_positions` should populate.
 
 ## Disabling / killing
 
-The League risk envelope already covers this. Either:
+Three escalating options, from soft to hard:
 
 ```sql
+-- 1. Move back to paper. The bot keeps running but takes the simulated
+--    path. Live orders stop instantly on the next cycle.
+update bot_registry set mode = 'paper' where bot_id = 'etf_rotation_v1';
+
+-- 2. Disable the bot entirely. risk.preflight refuses every order with
+--    REASON_KILL_BOT. The bot's cycle still runs (so health stays fresh)
+--    but it can't place orders even if mode says 'live'.
 update bot_registry set status = 'disabled' where bot_id = 'etf_rotation_v1';
--- or, harsher:
-update bot_registry set status = 'killed' where bot_id = 'etf_rotation_v1';
+
+-- 3. Kill switch — affects EVERY bot in the league, not just this one.
+--    Useful if something looks really wrong across the system.
+--    Reverse with `fly secrets unset LEAGUE_KILL`.
 ```
 
-The bot itself doesn't yet read `bot_registry.status` (Stage 5 is just the
-first paper bot; the preflight integration is Stage 6). For now, disable
-via the GHA workflow toggle in GitHub's UI, or by deleting the workflow
-trigger.
+```bash
+fly secrets set LEAGUE_KILL=1
+```
+
+Live order placement now goes through `risk.preflight()`, which checks
+all three of the above. Refusals are logged to `bot_events` with
+`event_type='RISK_REFUSED'` and the specific reason code.

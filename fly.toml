@@ -25,8 +25,11 @@ primary_region = 'iad'
   dockerfile = 'agent_runner/Dockerfile'
 
 # No HTTP service — the scheduler is a pure background worker. We don't
-# expose any inbound ports. Fly will keep the machine running because
-# there's no autostop=true here.
+# expose any inbound ports. There's no [[services]] block, which means
+# Fly's auto-stop-on-no-traffic logic doesn't apply to this machine at
+# all. We rely on the machine's restart_policy ('always' for background
+# workers; set explicitly via `fly machine update --restart=always` if
+# it isn't already — see Notes below) so any process exit gets restarted.
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '256mb'
@@ -49,3 +52,21 @@ primary_region = 'iad'
 # - No volumes — bot state.json files live in the container filesystem,
 #   which is recreated on each deploy. On restart, the bots self-heal
 #   (regime is re-derived from bars; positions are read from Supabase).
+# - Machine restart policy: should be 'always' for background workers.
+#   fly.toml doesn't have a stable schema for restart_policy yet, so we
+#   set it via the CLI. To check / fix:
+#
+#       fly status -a trading-bot-league-agent-runner
+#       # Look at the 'restart' field for the machine.
+#
+#       fly machine update <machine-id> --restart=always \
+#         -a trading-bot-league-agent-runner
+#
+# - The scheduler is in-memory (no persistent jobstore). After any
+#   restart, the next fire is at the NEXT scheduled time — missed runs
+#   during the downtime are dropped, never backfilled. This is the
+#   correct behavior for trading bots (a 'rebalance' fired 2 hours after
+#   the intended time would act on stale data) but is mildly annoying
+#   for league_health, which is the most frequent job. Persisting the
+#   jobstore would require a Fly volume (~$0.15/GB/month) and SQLAlchemy
+#   plumbing — not worth it for ~$2/yr of "saved" health checks.

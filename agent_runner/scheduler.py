@@ -242,6 +242,8 @@ def main() -> int:
     _print_startup_banner(sched)
 
     # Clean shutdown on SIGTERM (Fly.io) or SIGINT (local Ctrl+C).
+    # sys.exit(0) here is RIGHT — Fly sent us a signal because it wants
+    # us to stop, not because we crashed. Non-zero on signal would loop us.
     def _shutdown(signum, _frame):
         log.info("received signal %s, shutting down scheduler", signum)
         sched.shutdown(wait=False)
@@ -250,11 +252,22 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    # sched.start() is meant to block forever. If it ever returns on its
+    # own — meaning APScheduler exited without a signal — that's a bug we
+    # want Fly to learn about by RESTARTING the machine, not by quietly
+    # exiting 0 and (depending on machine restart policy) leaving the
+    # service down. So we signal failure on any unexpected return.
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):
-        pass
-    return 0
+        # SystemExit re-raised by _shutdown — already handled above.
+        raise
+    except BaseException as e:  # noqa: BLE001
+        log.exception("scheduler.start() raised: %r — exiting non-zero so Fly restarts", e)
+        return 2
+    # sched.start() returned without raising — that should never happen.
+    log.error("scheduler.start() returned without raising — exiting non-zero so Fly restarts")
+    return 3
 
 
 if __name__ == "__main__":

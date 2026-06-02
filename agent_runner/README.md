@@ -203,10 +203,15 @@ touched.
 
 ## What's intentionally NOT here yet
 
-- **Risk gate** (`league_core/risk.py`) — Phase 2. Will be added before
-  any agent is given execution authority.
 - **Live execution paths** for paper bots — Phase 3. Per-bot decision,
-  with tiny caps, after the gate is in place.
+  with tiny caps. The risk gate (`league_core/risk.py`) and the equity
+  order client (`league_core/public_api/equities.py`) both landed
+  2026-05-28; their smoke tests run with
+  `python -m league_core._risk_smoke` and
+  `python -m league_core._equities_smoke`. The remaining piece is
+  wiring `etf_rotation_v1` itself to call `risk.preflight()` +
+  `equities.place_market_buy/sell` when `mode='live'`, plus flipping
+  its `bot_registry` row to live with tight caps.
 - **HTTP `/healthz` endpoint** — could be useful for Fly's checks but
   not required. The scheduler not exiting IS the health signal; Fly
   restarts the machine if the process dies.
