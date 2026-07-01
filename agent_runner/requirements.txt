@@ -7,3 +7,15 @@
 apscheduler>=3.10,<4.0
 requests
 python-dotenv
+
+# Added 2026-06-01 for the stock_momentum_v1 + crypto_ema_atr_v1
+# migration from GHA. pandas and numpy are used by the stock bot's
+# indicators, momentum ranking, market_data helpers, and strategy;
+# supabase is used by both bots' own Supabase clients (their own
+# projects, NOT the League's — the League is written via raw requests
+# from league_core.status). matplotlib and yfinance from the stock
+# bot's original requirements.txt are backtest-only and intentionally
+# NOT added here (backtest scripts weren't vendored).
+pandas
+numpy
+supabase

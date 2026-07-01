@@ -1,0 +1,5 @@
+# requirements.txt
+
+requests>=2.31.0
+python-dotenv>=1.1.0
+supabase>=2.0.0        # v2 — response format is .data not .get("error")

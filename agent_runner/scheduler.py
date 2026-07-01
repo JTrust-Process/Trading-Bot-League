@@ -205,6 +205,38 @@ def build_scheduler() -> BlockingScheduler:
     # revival; if you re-enable, restore the add_job block from git history
     # and flip `bot_registry.status` back to 'enabled'.
 
+    # ── Live bots migrated from GHA — GATED by LIVE_BOTS_ENABLED env ────────
+    # stock_momentum_v1 and crypto_ema_atr_v1 were vendored into this repo on
+    # 2026-06-01 from `Trading Bot/Trading Bot Project/` and
+    # `Crypto_Trading_Project/Crypto_Trading_Bot/`. They are NOT scheduled
+    # here by default — only when `LIVE_BOTS_ENABLED` is a truthy env var.
+    #
+    # DANGER: enabling this while the corresponding GHA workflows are STILL
+    # running the same crons means BOTH schedulers will fire the live cycle.
+    # The stock bot's deterministic uuid5 order_id dedupes same-minute
+    # duplicates on Public's side, but any timing drift into a different
+    # minute would allow both to fill. See agent_runner/README.md § Cutover
+    # for the safe sequence: disable GHA crons FIRST, then flip this flag.
+    if os.getenv("LIVE_BOTS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        sched.add_job(
+            _run_bot, args=("stock_momentum_v1", "bots.stock_momentum_v1.main"),
+            trigger=CronTrigger.from_crontab("17 14-20 * * 1-5", timezone="UTC"),
+            id="stock_momentum_v1",
+            name="stock_momentum_v1 (weekday :17 mkt hrs)",
+        )
+        sched.add_job(
+            _run_bot, args=("crypto_ema_atr_v1", "bots.crypto_ema_atr_v1.main"),
+            trigger=CronTrigger.from_crontab("7,22,37,52 * * * *", timezone="UTC"),
+            id="crypto_ema_atr_v1",
+            name="crypto_ema_atr_v1 (every 15 min 24/7)",
+        )
+        log.info("LIVE_BOTS_ENABLED — stock_momentum_v1 and crypto_ema_atr_v1 SCHEDULED")
+    else:
+        log.info(
+            "LIVE_BOTS_ENABLED not set — stock_momentum_v1 and crypto_ema_atr_v1 "
+            "vendored but NOT scheduled on Fly (still running on GHA)"
+        )
+
     # ── League health — every 15 min, 24/7 ──────────────────────────────────
     sched.add_job(
         _run_league_health,

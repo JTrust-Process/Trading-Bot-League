@@ -1,0 +1,8 @@
+# Trading bot dependencies. Plain ASCII.
+requests
+python-dotenv
+pandas
+numpy
+matplotlib
+supabase
+yfinance

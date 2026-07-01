@@ -14,6 +14,8 @@ GitHub Actions free minutes.
 | `agent_research_v1`   | weekday 14:50 UTC                              | `bots.agent_research_v1.main`   |
 | `etf_rotation_v1`     | weekday hourly 14-20 UTC at :33                | `bots.etf_rotation_v1.main`     |
 | `short_watchlist_v1`  | weekday hourly 14-20 UTC at :41                | `bots.short_watchlist_v1.main`  |
+| `stock_momentum_v1`   | weekday hourly 14-20 UTC at :17 (**gated**)    | `bots.stock_momentum_v1.main`   |
+| `crypto_ema_atr_v1`   | every 15 min, 24/7 at `:07/:22/:37/:52` (**gated**) | `bots.crypto_ema_atr_v1.main` |
 | `league_health`       | every 15 min, 24/7 (`:09/:24/:39/:54`)         | `scripts.league_health.main`    |
 
 `public_shadow_v1` was previously scheduled every 10 min, 24/7. It was
@@ -22,10 +24,18 @@ dropped). Bot code remains in `bots/public_shadow_v1/` for future revival;
 to re-enable, restore the `add_job` block in `scheduler.py` from git
 history and flip `bot_registry.status` back to `'enabled'`.
 
-## What does NOT run here
+`stock_momentum_v1` and `crypto_ema_atr_v1` were vendored into this repo
+on 2026-06-01 as part of the GHA → Fly migration. They are **gated
+behind the `LIVE_BOTS_ENABLED` env var** — `LIVE_BOTS_ENABLED=1` (or
+`true`/`yes`/`on`) to schedule them, unset (or anything else) to leave
+them unscheduled on Fly. See the Cutover section below for the safe
+sequence to flip this on.
 
-- `stock_momentum_v1` — stays on its existing GHA workflow. Live capital.
-- `crypto_ema_atr_v1` — stays on its existing GHA workflow. Live capital.
+## What does NOT run here (yet)
+
+Nothing! Both live bots have been vendored and are ready to run on Fly
+once you complete the cutover procedure below. Until then they continue
+to run on their existing GHA workflows in their original repos.
 
 Those two stay on GHA on purpose. The agent_runner is intentionally
 isolated from your live trading bots so a problem here can't take them
@@ -141,6 +151,92 @@ fly logs
 
 You should see the startup banner listing all 6 jobs with their next-run
 times, then quiet until the next scheduled cron tick.
+
+## Cutover — moving stock_momentum_v1 and crypto_ema_atr_v1 from GHA to Fly
+
+Vendor phase is complete on 2026-06-01 (source lives here now; smoke
+tests passed). This section is the runbook for actually cutting each
+live bot over. **Danger window**: any period during which both GHA and
+Fly are firing the same cron for the same bot. Same-minute duplicates
+dedupe via the deterministic `uuid5` order_id (see `bot.py`
+`deterministic_order_id`), but cross-minute duplicates would both fill.
+
+Do stock first (weekdays 14-20 UTC only — cut over on a weekend, plenty
+of dead time), then crypto (24/7 — pick a quiet window and tail logs).
+
+### Steps for each live bot
+
+1. **Set Fly secrets** for the bot's environment. For `stock_momentum_v1`:
+   - `SUPABASE_URL` (the bot's OWN Supabase project — separate from
+     `LEAGUE_SUPABASE_URL` which is already set)
+   - `SUPABASE_SERVICE_KEY`
+   - `POLYGON_API_KEY`
+   - `DISCORD_WEBHOOK_URL` (if different from ETF's)
+   - Plus the bot's tuning env vars (all the `MOMENTUM_*` / `MAX_*` /
+     `STOP_LOSS_*` etc. — see `Trading Bot/Trading Bot Project/.github/workflows/trading-bot.yml`
+     for the canonical list). Prefer `fly.toml [env]` for non-secret
+     tuning, `fly secrets` for anything actually sensitive.
+
+   For `crypto_ema_atr_v1`:
+   - `SUPABASE_URL` (crypto's Supabase project — different from stock's)
+   - `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`
+   - The crypto-bot tuning env vars from
+     `Crypto_Trading_Project/Crypto_Trading_Bot/.github/workflows/crypto_bot.yaml`.
+
+2. **Sanity-run once locally** with those env vars exported to confirm
+   the bot boots cleanly against real credentials:
+   ```powershell
+   $env:LEAGUE_BOT_ID = "stock_momentum_v1"; python -m bots.stock_momentum_v1.main
+   ```
+   You should see a full run: bars fetched, positions read, no orders
+   placed if the strategy didn't fire, order placement path exercised
+   if it did.
+
+3. **Deploy the code to Fly** WITHOUT setting `LIVE_BOTS_ENABLED`. The
+   startup banner should show `LIVE_BOTS_ENABLED not set — ... vendored
+   but NOT scheduled on Fly`. This is the safe intermediate state — Fly
+   has the code but isn't running it.
+
+4. **Disable the GHA cron** for the bot you're cutting over. In the
+   original repo, comment out the `schedule:` block in the workflow YAML
+   (keep `workflow_dispatch:` so you can still trigger runs manually).
+   Push to the default branch. Confirm on GitHub that the next scheduled
+   run does NOT appear on the Actions tab.
+
+5. **Enable Fly scheduling**:
+   ```powershell
+   fly secrets set LIVE_BOTS_ENABLED=1 -a trading-bot-league-agent-runner
+   ```
+   Fly restarts the machine automatically after setting secrets. Watch
+   the startup banner:
+   ```powershell
+   fly logs -a trading-bot-league-agent-runner | Select-String "SCHEDULED"
+   ```
+   You should see `LIVE_BOTS_ENABLED — stock_momentum_v1 and
+   crypto_ema_atr_v1 SCHEDULED`.
+
+6. **Watch the first cycle on Fly**. For stock the next :17 on a weekday
+   in 14-20 UTC. For crypto the next :07/:22/:37/:52. Tail logs:
+   ```powershell
+   fly logs -a trading-bot-league-agent-runner | Select-String "stock_momentum_v1|crypto_ema_atr_v1"
+   ```
+   Confirm one cycle lands cleanly (no ImportError, no auth failures,
+   `bot_runs` row shows `success` in Supabase).
+
+7. **Watch for a week.** If clean, delete the GHA workflow file entirely
+   from the original repo. If not clean, unset `LIVE_BOTS_ENABLED` (Fly
+   restarts, bot stops on Fly), re-enable the GHA cron by uncommenting
+   the `schedule:` block, and debug on the Fly side without live-capital
+   pressure.
+
+### Order-placement risk gate (deferred)
+
+The vendored bots still enforce risk via their own internal
+`MAX_ORDER_AMOUNT_USD`, `DAILY_LOSS_LIMIT`, etc. — same as they did on
+GHA. Wiring `league_core.risk.preflight()` into their order-placement
+paths as an ADDITIONAL centralized gate is a separate PR after cutover
+is stable. The bots' own limits still apply during cutover, so the
+existing safety envelope is preserved.
 
 ## Retiring the corresponding GHA workflows
 

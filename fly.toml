@@ -32,7 +32,12 @@ primary_region = 'iad'
 # it isn't already — see Notes below) so any process exit gets restarted.
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '256mb'
+  # Bumped from 256mb -> 512mb on 2026-06-01 for the stock_momentum_v1
+  # and crypto_ema_atr_v1 migration. pandas + numpy resident during a
+  # stock cycle adds ~50-100mb; the old 256mb was fine for the
+  # paper/research bots (idled ~80mb, peaked ~150mb) but too tight once
+  # the live bots also run in-process. Adds ~$2/month.
+  memory = '512mb'
 
 [deploy]
   # Single machine, never scale to zero — we need the scheduler awake.
