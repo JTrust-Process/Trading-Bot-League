@@ -166,22 +166,53 @@ of dead time), then crypto (24/7 — pick a quiet window and tail logs).
 
 ### Steps for each live bot
 
-1. **Set Fly secrets** for the bot's environment. For `stock_momentum_v1`:
-   - `SUPABASE_URL` (the bot's OWN Supabase project — separate from
-     `LEAGUE_SUPABASE_URL` which is already set)
-   - `SUPABASE_SERVICE_KEY`
-   - `POLYGON_API_KEY`
-   - `DISCORD_WEBHOOK_URL` (if different from ETF's)
-   - Plus the bot's tuning env vars (all the `MOMENTUM_*` / `MAX_*` /
-     `STOP_LOSS_*` etc. — see `Trading Bot/Trading Bot Project/.github/workflows/trading-bot.yml`
-     for the canonical list). Prefer `fly.toml [env]` for non-secret
-     tuning, `fly secrets` for anything actually sensitive.
+1. **Set Fly secrets** for the bot's environment.
+
+   Bot-specific tuning already lives in `fly.toml [env]` with
+   `STOCK_` / `CRYPTO_` prefixes; the scheduler auto-strips the prefix
+   for the duration of each bot's job (see `_bot_env_scope` and
+   `_BOT_ENV_PREFIX` in `agent_runner/scheduler.py`). Fly SECRETS follow
+   the same prefix convention for anything sensitive that can't be
+   committed to the toml.
+
+   **Bot-specific secrets** (`fly secrets set ...`):
+
+   For `stock_momentum_v1`:
+   - `STOCK_SUPABASE_URL` — the stock bot's OWN Supabase project.
+   - `STOCK_SUPABASE_SERVICE_KEY` — its service-role key.
+   - `POLYGON_API_KEY` — for stock prices. Unprefixed because crypto
+     doesn't use it, so no collision risk.
 
    For `crypto_ema_atr_v1`:
-   - `SUPABASE_URL` (crypto's Supabase project — different from stock's)
-   - `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`
-   - The crypto-bot tuning env vars from
-     `Crypto_Trading_Project/Crypto_Trading_Bot/.github/workflows/crypto_bot.yaml`.
+   - `CRYPTO_SUPABASE_URL` — the crypto bot's OWN Supabase project.
+   - `CRYPTO_SUPABASE_KEY` — its service-role key. Note: the crypto
+     bot's code reads a single `SUPABASE_KEY` (not `SUPABASE_ANON_KEY`
+     / `SUPABASE_SERVICE_KEY`); use whichever role you had in the
+     original GHA `SUPABASE_KEY` secret.
+
+   **Shared secrets** (unprefixed — one value both bots see):
+   - `DISCORD_WEBHOOK_URL` — same webhook for both bots' notifications
+     (jerry confirmed 2026-06-01). If you also want the paper bots'
+     League-level notifications to go here, set
+     `LEAGUE_DISCORD_WEBHOOK_URL` to the same value.
+   - `PUBLIC_SECRET`, `PUBLIC_ACCOUNT_ID`, `LEAGUE_SUPABASE_URL`,
+     `LEAGUE_SUPABASE_KEY` — already set on Fly for the ETF and other
+     paper bots.
+
+   **One-liner:**
+
+   ```powershell
+   fly secrets set `
+     -a trading-bot-league-agent-runner `
+     STOCK_SUPABASE_URL='https://<stock-project>.supabase.co' `
+     STOCK_SUPABASE_SERVICE_KEY='<stock-service-role-key>' `
+     POLYGON_API_KEY='<polygon-key>' `
+     CRYPTO_SUPABASE_URL='https://<crypto-project>.supabase.co' `
+     CRYPTO_SUPABASE_KEY='<crypto-supabase-key>' `
+     DISCORD_WEBHOOK_URL='<discord-webhook-url>'
+   ```
+
+   Setting secrets triggers a machine restart automatically.
 
 2. **Sanity-run once locally** with those env vars exported to confirm
    the bot boots cleanly against real credentials:

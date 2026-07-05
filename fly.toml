@@ -46,6 +46,77 @@ primary_region = 'iad'
 [processes]
   app = 'python -m agent_runner.scheduler'
 
+# ── Non-secret env vars ────────────────────────────────────────────────
+# Everything in this [env] block ships in fly.toml (visible in git).
+# Actual secrets live in Fly secrets (`fly secrets set ...`) and are
+# NOT here.
+#
+# Naming convention: bot-specific tuning is set with a bot-prefix
+# (STOCK_ / CRYPTO_) that the scheduler auto-strips per-job. See
+# `_bot_env_scope` and `_BOT_ENV_PREFIX` in agent_runner/scheduler.py.
+# Shared vars are unprefixed.
+#
+# Source of truth for the values below: the original GHA workflows
+# (`Trading Bot/Trading Bot Project/.github/workflows/trading-bot.yml`
+# and `Crypto_Trading_Project/Crypto_Trading_Bot/.github/workflows/crypto_bot.yaml`).
+# If you tune a value here, update those workflows too until they're
+# retired, so a rollback keeps the same parameters.
+
+[env]
+  # ── Shared ─────────────────────────────────────────────────────────────
+  TZ = "America/New_York"
+
+  # ── stock_momentum_v1 (STOCK_ prefix → stripped at job time) ──────────
+  STOCK_MODE                      = "live"
+  STOCK_RUN_ONCE                  = "1"
+  STOCK_SYMBOLS                   = "QQQ,SCHB,SCHD,SGOV,SPY,VTI"
+  STOCK_SCAN_SYMBOLS              = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA"
+  STOCK_MANAGE_ALL_POSITIONS      = "true"
+  STOCK_MOMENTUM_SYMBOLS          = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,QQQ,SPY"
+  STOCK_MOMENTUM_TOP_N            = "3"
+  STOCK_MOMENTUM_SELL_RANK        = "5"
+  STOCK_MAX_TRADES_PER_DAY        = "5"
+  STOCK_MAX_ORDER_AMOUNT_USD      = "15"
+  STOCK_MAX_OPEN_POSITIONS        = "8"
+  STOCK_BASE_POSITION_SIZE        = "0.10"
+  STOCK_MAX_POSITION_SCALE        = "2.0"
+  STOCK_TAKE_PROFIT_BASE          = "0.04"
+  STOCK_STOP_LOSS_BASE            = "0.025"
+  STOCK_CONFIDENCE_MIN_THRESHOLD  = "0.65"
+  STOCK_BREAKOUT_LOOKBACK         = "25"
+  STOCK_BREAKOUT_VOL_MULTIPLIER   = "1.2"
+  STOCK_MAX_DRAWDOWN              = "0.08"
+  STOCK_DAILY_LOSS_LIMIT          = "0.03"
+  STOCK_LOSS_COOLDOWN_DAYS        = "3"
+  STOCK_MIN_HOLD_DAYS             = "2"
+  STOCK_MAX_EXPOSURE_EARLY        = "0.90"
+  STOCK_REGIME_SYMBOL             = "SPY"
+  STOCK_REGIME_FAST               = "20"
+  STOCK_REGIME_SLOW               = "50"
+  STOCK_ATR_PERIOD                = "14"
+  STOCK_ATR_VOL_THRESHOLD         = "0.01"
+  STOCK_TREND_FAST                = "5"
+  STOCK_TREND_SLOW                = "20"
+  STOCK_TREND_STRONG_THRESHOLD    = "0.5"
+
+  # ── crypto_ema_atr_v1 (CRYPTO_ prefix → stripped at job time) ─────────
+  CRYPTO_SYMBOLS                  = "BTC"
+  CRYPTO_INITIAL_CAPITAL          = "50"
+  CRYPTO_RISK_PER_TRADE           = "0.02"
+  CRYPTO_STOP_LOSS_PCT            = "0.03"
+  CRYPTO_TAKE_PROFIT_PCT          = "0.05"
+  CRYPTO_MAX_ORDER_AMOUNT_USD     = "25"
+  CRYPTO_MIN_BUYING_POWER_BUFFER  = "25"
+  CRYPTO_CIRCUIT_BREAKER_LOSSES   = "3"
+  CRYPTO_MIN_SIGNAL_GAP_PCT       = "0.0015"
+  CRYPTO_MIN_SIGNAL_PROFIT_PCT    = "0.03"
+  CRYPTO_MIN_HOLD_CANDLES         = "4"
+  CRYPTO_ATR_PERIOD               = "14"
+  CRYPTO_ATR_SL_MULTIPLIER        = "2.0"
+  CRYPTO_ATR_TP_MULTIPLIER        = "4.0"
+  CRYPTO_COOLDOWN_CANDLES         = "4"
+  CRYPTO_DRY_RUN                  = "0"
+
 # Notes:
 # - shared-cpu-1x at 256MB is the smallest VM Fly offers. Our service
 #   idles at ~80MB and spikes briefly to ~150MB during bot cycles. Fine.

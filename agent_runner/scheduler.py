@@ -76,22 +76,88 @@ def _safe_import(module_path: str, attr: str):
 
 
 # ── Env-var swap helper ────────────────────────────────────────────────────
+#
+# Two concerns handled by _bot_env_scope below:
+#
+# 1. LEAGUE_BOT_ID — every bot's League adapter reads this to know which
+#    bot_registry / bot_status row to write to. Swapped per job so a
+#    single scheduler process can host bots with different bot_ids.
+#
+# 2. Per-bot env prefix stripping — some bots read env vars whose names
+#    COLLIDE across bots on a single Fly process:
+#      - stock_momentum_v1 and crypto_ema_atr_v1 both read SUPABASE_URL
+#        (different Supabase projects), SUPABASE_KEY/SUPABASE_SERVICE_KEY
+#        (different keys), SYMBOLS ("QQQ,SPY,..." vs "BTC"),
+#        MAX_ORDER_AMOUNT_USD ($15 vs $25), ATR_PERIOD (semantic diff),
+#        and other tuning vars.
+#      - On GHA each bot had its own workflow env; on Fly they share one
+#        process.
+#
+#    Solution: set every bot-specific var on Fly (as a secret OR in
+#    fly.toml [env]) with the bot's prefix — `STOCK_` for
+#    stock_momentum_v1, `CRYPTO_` for crypto_ema_atr_v1. The scheduler
+#    auto-strips the prefix for the duration of that bot's job.
+#    `STOCK_MAX_ORDER_AMOUNT_USD` becomes `MAX_ORDER_AMOUNT_USD` while
+#    the stock bot runs, then reverts. Vendored bot code stays
+#    byte-identical — no renames inside the source.
+#
+#    Adding a new tuning var? Just set `STOCK_NEWTHING=...` (or
+#    `CRYPTO_NEWTHING=...`) on Fly. No scheduler.py edit needed.
+#
+#    Adding a new bot that needs this pattern? Add its prefix to
+#    _BOT_ENV_PREFIX below.
+#
+# Shared env vars (PUBLIC_SECRET, PUBLIC_ACCOUNT_ID, DISCORD_WEBHOOK_URL,
+# LEAGUE_SUPABASE_URL/KEY, TZ, etc.) are NOT prefixed — every bot reads
+# them under the same name, so we set them once as flat Fly secrets or
+# fly.toml [env] entries.
+
+_BOT_ENV_PREFIX: dict[str, str] = {
+    "stock_momentum_v1":  "STOCK_",
+    "crypto_ema_atr_v1":  "CRYPTO_",
+}
+
 
 @contextmanager
-def _league_bot_id(bot_id: str):
-    """Temporarily set LEAGUE_BOT_ID for the duration of a single job run.
+def _bot_env_scope(bot_id: str):
+    """Temporarily set LEAGUE_BOT_ID plus any prefix-stripped env
+    overrides for the duration of one job run. See _BOT_ENV_PREFIX and
+    the module-level notes for the design.
 
-    Restores the previous value on exit. NOT thread-safe — relies on
-    APScheduler being configured with max_workers=1."""
-    prev = os.environ.get("LEAGUE_BOT_ID")
-    os.environ["LEAGUE_BOT_ID"] = bot_id
+    For a bot with prefix `STOCK_`, EVERY env var starting with
+    `STOCK_` is copied to its unprefixed name for the job's lifetime
+    (`STOCK_SYMBOLS` → `SYMBOLS`, `STOCK_SUPABASE_URL` → `SUPABASE_URL`,
+    etc.). Overrides win over any pre-existing unprefixed value; prior
+    values are restored on exit.
+
+    NOT thread-safe — relies on APScheduler being configured with
+    max_workers=1 (see build_scheduler below).
+    """
+    # Start with the mandatory LEAGUE_BOT_ID override.
+    overrides: dict[str, str] = {"LEAGUE_BOT_ID": bot_id}
+
+    # Auto-strip the bot's env prefix from every matching env var.
+    prefix = _BOT_ENV_PREFIX.get(bot_id)
+    if prefix:
+        for src_key, val in list(os.environ.items()):
+            if src_key.startswith(prefix):
+                target_key = src_key[len(prefix):]
+                # Skip an env var that's literally just the prefix
+                # (unlikely, but a value like "STOCK_" would map to "").
+                if target_key:
+                    overrides[target_key] = val
+
+    prev = {k: os.environ.get(k) for k in overrides}
+    for k, v in overrides.items():
+        os.environ[k] = v
     try:
         yield
     finally:
-        if prev is None:
-            os.environ.pop("LEAGUE_BOT_ID", None)
-        else:
-            os.environ["LEAGUE_BOT_ID"] = prev
+        for k, prev_v in prev.items():
+            if prev_v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev_v
 
 
 # ── Job wrappers ───────────────────────────────────────────────────────────
@@ -110,7 +176,7 @@ def _run_bot(bot_id: str, module_path: str, attr: str = "run_cycle") -> None:
         log.error("× job aborted: could not import %s.%s", module_path, attr)
         return
     try:
-        with _league_bot_id(bot_id):
+        with _bot_env_scope(bot_id):
             result = fn()
         log.info("✓ job done: %s status=%s", bot_id, result)
     except Exception as e:  # noqa: BLE001
