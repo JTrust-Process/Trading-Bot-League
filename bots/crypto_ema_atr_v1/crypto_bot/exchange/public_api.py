@@ -1,5 +1,6 @@
 # crypto_bot/exchange/public_api.py
 
+import os
 import uuid
 import requests
 from crypto_bot.config.settings import get_public_api_key
@@ -71,12 +72,68 @@ def get_accounts() -> dict:
     return resp.json()
 
 
+_account_id_cache: dict = {"account_id": None}
+
+
+def _mask_acct(v) -> str:
+    s = str(v or "")
+    return s[:4] + "..." + s[-4:] if len(s) > 8 else (s or "?")
+
+
 def get_primary_account_id() -> str:
+    """Resolve the brokerage account to trade on.
+
+    HISTORY (2026-07-25): this previously returned `accounts[0]` with no
+    pin and no validation. Public's account ordering is NOT stable, and
+    the user now has 7 accounts (3 brokerage). The ordering shifted at
+    some point and moved this bot off 5OG08899 — where its crypto
+    position actually sits — onto whichever account happened to be first.
+    Silently trading the wrong account is a serious failure mode, so the
+    resolver now honors an explicit pin and validates it.
+
+    Resolution order:
+      1. PUBLIC_ACCOUNT_ID env var, VALIDATED against the account list.
+         Not in the list -> raise. Trading the wrong account is worse
+         than not trading.
+      2. Unset -> accounts[0], with a loud warning when more than one
+         account exists (that's the ambiguous case that caused the drift).
+
+    Result is cached per process; the account cannot change mid-cycle.
+    """
+    cached = _account_id_cache.get("account_id")
+    if cached:
+        return str(cached)
+
     data = get_accounts()
-    accounts = data.get("accounts", [])
-    if accounts:
-        return accounts[0]["accountId"]
-    raise RuntimeError(f"No accounts found. Full response: {data}")
+    accounts = [a for a in (data.get("accounts") or []) if isinstance(a, dict)]
+    if not accounts:
+        raise RuntimeError(f"No accounts found. Full response: {data}")
+
+    valid = {str(a.get("accountId")) for a in accounts if a.get("accountId")}
+    pinned = (os.getenv("PUBLIC_ACCOUNT_ID") or "").strip()
+
+    if pinned:
+        if pinned in valid:
+            print(f"[public_api] account {_mask_acct(pinned)} "
+                  f"(pinned via PUBLIC_ACCOUNT_ID)")
+            _account_id_cache["account_id"] = pinned
+            return pinned
+        raise RuntimeError(
+            f"PUBLIC_ACCOUNT_ID={_mask_acct(pinned)} is not in this key's "
+            f"account list {sorted(_mask_acct(v) for v in valid)}. Refusing to "
+            f"fall back to accounts[0] — that is how this bot silently drifted "
+            f"onto the wrong account. Fix the secret."
+        )
+
+    acct = str(accounts[0].get("accountId") or "")
+    if not acct:
+        raise RuntimeError(f"First account has no accountId. Full response: {data}")
+    if len(accounts) > 1:
+        print(f"[public_api] WARNING: {len(accounts)} accounts returned and "
+              f"PUBLIC_ACCOUNT_ID is unset; defaulting to {_mask_acct(acct)}. "
+              f"Pin it explicitly — ordering is not guaranteed stable.")
+    _account_id_cache["account_id"] = acct
+    return acct
 
 
 # ── Market data ───────────────────────────────────────────────────────────────
