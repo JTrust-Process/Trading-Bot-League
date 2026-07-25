@@ -3,19 +3,49 @@
 GitHub Actions runs this once per scheduled trigger. The bot:
 
   1. Starts a League run.
-  2. For each symbol in screener.UNIVERSE:
+  2. Fetches SPY bars, derives the broader-market regime, and (if the
+     regime gate is enabled) suppresses ALL new entries when SPY is in
+     a bull regime. Existing positions are ALWAYS managed regardless
+     of regime — the exit rules are the working part.
+  3. For each symbol in screener.UNIVERSE:
        a. Fetch daily bars from Public.
        b. If we already have an open paper short on this symbol, run the
           exit detector. On any exit rule trigger, log a SHORT-exit signal,
           log a COVER trade, and close the paper position.
-       c. Otherwise run the entry detector. On a fresh bearish setup, log
-          a SHORT signal, log a SHORT trade, and open a paper position.
-  3. Ends the run.
+       c. Otherwise (and only if the regime gate lets entries through):
+          - Run the entry detector (screener rules).
+          - Apply the min-confidence filter (SHORT_MIN_CONFIDENCE).
+          - Apply the relative-weakness filter vs SPY 3m return
+            (SHORT_REL_WEAKNESS_PCT).
+          - If all pass, log a SHORT signal, log a SHORT trade, and open
+            a paper position.
+  4. Ends the run.
 
 NEVER calls a live order endpoint. NEVER touches Public's order surface.
 All trades are paper: side='SHORT' on entry, side='COVER' on exit, with
 is_paper=True. Positions carry metadata={"direction":"short"} so the
 dashboard can render them distinctly.
+
+Entry-gate env vars (added 2026-07-24 after a paper-perf review showed
+the strategy losing money in a persistent bull regime — the gates
+prevent entries in the wrong environment without touching the working
+exit logic; existing positions are unaffected):
+
+  SHORT_REGIME_GATE        Enable/disable the SPY regime gate. Default 'true'.
+                           When true, no new shorts are opened while
+                           SPY close > SPY SMA(SHORT_REGIME_SMA), i.e.
+                           bull regime. Also treated as "skip" if SPY
+                           bars can't be fetched (fail-safe).
+  SHORT_REGIME_SMA         SMA period for the regime gate. Default 200.
+  SHORT_MIN_CONFIDENCE     Min entry confidence to open a short.
+                           Default 0.70. Screener returns [0.5, 1.0];
+                           the old bot took every setup >= 0.5 which is
+                           part of why paper performance was poor.
+  SHORT_REL_WEAKNESS_PCT   Minimum underperformance vs SPY 3m return
+                           required to short a symbol. Default 0.05 (5%).
+                           Symbol's 3m return must be worse than SPY's
+                           by at least this much. Prevents shorting
+                           strong momentum leaders during index rallies.
 
 Exits 0 even on warnings — the schedule should keep running. Run status
 is recorded in bot_runs for visibility.
@@ -67,6 +97,21 @@ SYMBOLS = (
     tuple(s.strip().upper() for s in _OVERRIDE.split(",") if s.strip())
     if _OVERRIDE else screener.UNIVERSE
 )
+
+
+# ── Entry gates (added 2026-07-24; see module docstring for rationale) ─────
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+REGIME_GATE_ENABLED = _env_bool("SHORT_REGIME_GATE",  True)
+REGIME_SMA_PERIOD   = int(os.getenv("SHORT_REGIME_SMA", "200") or "200")
+MIN_CONFIDENCE      = _env_float("SHORT_MIN_CONFIDENCE",    0.70)
+REL_WEAKNESS_PCT    = _env_float("SHORT_REL_WEAKNESS_PCT",  0.05)
 
 
 def _utcnow_iso() -> str:
@@ -195,6 +240,73 @@ def _close_paper_short(
     return pnl_usd, pnl_pct
 
 
+# ── Market context (added 2026-07-24 — see module docstring) ───────────────
+
+
+def _market_context(bars_period: str) -> dict:
+    """Fetch SPY bars and derive the broader-market context used to gate
+    entries. Called once per cycle; result is reused for every symbol.
+
+    Returned dict keys:
+      spy_close     — latest SPY close, or None if fetch failed
+      spy_sma       — SPY SMA(REGIME_SMA_PERIOD), or None if too few bars
+      spy_ret_3m    — SPY 3-month return, or None if too few bars
+      regime        — 'bull' | 'bear' | 'unknown'
+      skip_entries  — True when this cycle should not open ANY new shorts
+
+    Fail-safe: if SPY data can't be fetched OR the regime gate is
+    enabled and regime is bull/unknown, skip_entries becomes True.
+    Existing positions are unaffected — the exit path in run_cycle runs
+    for every open position regardless of ctx.
+    """
+    ctx: dict = {
+        "spy_close":    None,
+        "spy_sma":      None,
+        "spy_ret_3m":   None,
+        "regime":       "unknown",
+        "skip_entries": False,
+    }
+
+    try:
+        bars = get_public_bars("SPY", period=bars_period)
+    except Exception:  # noqa: BLE001
+        bars = None
+    if not bars:
+        # Can't measure — fail-safe: if the gate is enabled, skip entries.
+        ctx["skip_entries"] = REGIME_GATE_ENABLED
+        return ctx
+
+    closes: list[float] = []
+    for b in bars:
+        try:
+            closes.append(float(b["close"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not closes:
+        ctx["skip_entries"] = REGIME_GATE_ENABLED
+        return ctx
+
+    ctx["spy_close"] = float(closes[-1])
+
+    if len(closes) >= REGIME_SMA_PERIOD:
+        sma = sum(closes[-REGIME_SMA_PERIOD:]) / float(REGIME_SMA_PERIOD)
+        ctx["spy_sma"] = sma
+        ctx["regime"]  = "bull" if ctx["spy_close"] > sma else "bear"
+
+    # Reuse the screener's lookback so the relative-weakness comparison
+    # is apples-to-apples with what detect_entry computes per symbol.
+    if len(closes) >= screener.MOMENTUM_LOOKBACK + 1:
+        start = closes[-(screener.MOMENTUM_LOOKBACK + 1)]
+        end   = closes[-1]
+        if start > 0:
+            ctx["spy_ret_3m"] = (end / start) - 1.0
+
+    if REGIME_GATE_ENABLED and ctx["regime"] in ("bull", "unknown"):
+        ctx["skip_entries"] = True
+
+    return ctx
+
+
 # ── Core ────────────────────────────────────────────────────────────────────
 
 
@@ -209,6 +321,30 @@ def run_cycle() -> str:
 
     run_id = league.start_run("cron")
     print(f"[short] league run_id={run_id}")
+
+    # Market context (regime + relative-weakness reference). Computed
+    # ONCE per cycle and reused when filtering entries below. Existing
+    # positions are unaffected — exit path runs unconditionally.
+    ctx = _market_context(BARS_PERIOD)
+    print(f"[short] SPY close={ctx['spy_close']} sma{REGIME_SMA_PERIOD}={ctx['spy_sma']} "
+          f"regime={ctx['regime']} spy_ret_3m={ctx['spy_ret_3m']} "
+          f"skip_entries={ctx['skip_entries']}")
+    league.log_event(
+        event_type="MARKET_CONTEXT",
+        message=f"regime={ctx['regime']} skip_entries={ctx['skip_entries']}",
+        metadata={
+            "spy_close":         ctx["spy_close"],
+            "spy_sma":           ctx["spy_sma"],
+            "spy_ret_3m":        ctx["spy_ret_3m"],
+            "regime":            ctx["regime"],
+            "regime_sma_period": REGIME_SMA_PERIOD,
+            "regime_gate":       REGIME_GATE_ENABLED,
+            "min_confidence":    MIN_CONFIDENCE,
+            "rel_weakness_pct":  REL_WEAKNESS_PCT,
+            "skip_entries":      ctx["skip_entries"],
+        },
+        run_id=run_id,
+    )
 
     try:
         opened = 0
@@ -255,11 +391,28 @@ def run_cycle() -> str:
                     f"@ {exit_sig.close:.2f}  pnl=${pnl_usd:+.2f} ({pnl_pct*100:+.2f}%)"
                 )
             else:
-                # No open position — look for a fresh setup.
+                # No open position — look for a fresh setup, filtered by
+                # regime gate + min confidence + relative weakness. Any
+                # filter fail = continue (no trade this cycle).
+                if ctx["skip_entries"]:
+                    print(f"[short] {sym}: entries suppressed by regime gate "
+                          f"(regime={ctx['regime']}); skipping")
+                    continue
                 entry_sig = screener.detect_entry(sym, bars)
                 if entry_sig is None:
                     print(f"[short] {sym}: no entry signal")
                     continue
+                if entry_sig.confidence < MIN_CONFIDENCE:
+                    print(f"[short] {sym}: entry conf {entry_sig.confidence:.2f} < "
+                          f"min {MIN_CONFIDENCE:.2f}; skipping")
+                    continue
+                if ctx["spy_ret_3m"] is not None:
+                    required = ctx["spy_ret_3m"] - REL_WEAKNESS_PCT
+                    if entry_sig.ret_3m >= required:
+                        print(f"[short] {sym}: 3m ret {entry_sig.ret_3m*100:+.2f}% "
+                              f"not weaker than SPY {ctx['spy_ret_3m']*100:+.2f}% by "
+                              f"{REL_WEAKNESS_PCT*100:.2f}%; skipping")
+                        continue
                 wrote = _open_paper_short(
                     run_id, entry_sig,
                     capital=float(s["paper_short_capital_per_trade"]),
