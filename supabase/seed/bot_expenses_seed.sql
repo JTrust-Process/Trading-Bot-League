@@ -50,7 +50,15 @@ insert into public.bot_expenses (
   bot_id, category, amount_usd, period, recurring, note
 ) values
   (NULL, 'anthropic_api', 1.00, '2026', true,
-   'agent_research_v1 — Haiku /v1/messages calls, ~$0.003/run × ~250 weekday fires.')
+   'agent_research_v1 — Haiku /v1/messages calls. ESTIMATE ONLY, never '
+   || 'measured. Two known reasons it is wrong: (1) the $0.003/run figure '
+   || 'was a guess, and (2) the bot ran on BOTH GHA and Fly from 2026-07-24 '
+   || 'until the duplicate crons were disabled 2026-07-25, so real spend was '
+   || 'roughly double for that window — and the duplicate GHA cron had been '
+   || 'firing alongside Fly for the paper bots far longer. As of 2026-07-25 '
+   || 'actual token counts are recorded per run in bot_events metadata under '
+   || 'AGENT_BRIEF.usage. Replace this row with a measured figure once a '
+   || 'few weeks of real data exist.')
 on conflict (coalesce(bot_id, '__league__'), category, period) do update set
   amount_usd = excluded.amount_usd,
   recurring  = excluded.recurring,

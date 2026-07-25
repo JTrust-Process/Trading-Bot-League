@@ -24,6 +24,18 @@ import requests
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
+# Token usage from the most recent call() — populated on success, reset to
+# {} on failure. Read by main.py so the cycle can record what it actually
+# spent instead of relying on an estimate.
+#
+# Added 2026-07-25. Until now the `usage` block Anthropic returns on every
+# response was discarded, which meant this bot's cost was never measured.
+# bot_expenses_seed.sql asserts "~$0.003/run x ~250 weekday fires" as though
+# it were known; it was a guess, and it was ~2x low anyway because the bot
+# ran on BOTH GHA and Fly from the 2026-07-24 migration until the duplicate
+# crons were disabled on 2026-07-25.
+LAST_USAGE: Dict[str, Any] = {}
+
 # Default model — Haiku is cheap (~$0.003 per daily run on this size of
 # context) and plenty capable for structured summarization. Override via
 # AGENT_MODEL env var if you want Sonnet / Opus.
@@ -41,7 +53,13 @@ def call(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> Optional[str]:
     """Send a single-turn message to Claude. Returns the assistant's text,
-    or None on any error. Fail-silent."""
+    or None on any error. Fail-silent.
+
+    Side effect: populates module-level LAST_USAGE with the token counts
+    from this call (cleared first, so a failed call leaves it empty rather
+    than stale from a previous run).
+    """
+    LAST_USAGE.clear()
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         print("[agent.llm] ANTHROPIC_API_KEY not set; skipping LLM call")
@@ -80,6 +98,32 @@ def call(
         print(f"[agent.llm] json decode failed: {e!r}")
         return None
 
+    # Record what this call actually consumed. Anthropic returns e.g.
+    # {"input_tokens": 1234, "output_tokens": 567}. We deliberately do NOT
+    # convert to dollars here — per-token pricing is not something this
+    # module can know reliably, and a stale hardcoded rate would just
+    # recreate the "confident number with nothing behind it" problem this
+    # is meant to fix. Set AGENT_COST_PER_MTOK_IN / _OUT (dollars per
+    # MILLION tokens) if you want an estimated_cost_usd computed; leave
+    # them unset and only the raw token counts are recorded.
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        LAST_USAGE.update({
+            "model":         payload["model"],
+            "input_tokens":  usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+        })
+        cost = _estimate_cost_usd(
+            LAST_USAGE.get("input_tokens"),
+            LAST_USAGE.get("output_tokens"),
+        )
+        if cost is not None:
+            LAST_USAGE["estimated_cost_usd"] = cost
+        print(f"[agent.llm] usage model={LAST_USAGE['model']} "
+              f"in={LAST_USAGE.get('input_tokens')} "
+              f"out={LAST_USAGE.get('output_tokens')}"
+              + (f" est=${cost:.5f}" if cost is not None else ""))
+
     # Anthropic returns content as a list of blocks; text blocks have type='text'.
     blocks = data.get("content") or []
     parts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
@@ -88,6 +132,25 @@ def call(
         print("[agent.llm] empty assistant text in response")
         return None
     return text
+
+
+def _estimate_cost_usd(in_tokens: Any, out_tokens: Any) -> Optional[float]:
+    """Estimate spend from token counts, but ONLY when rates are configured.
+
+    Returns None unless both AGENT_COST_PER_MTOK_IN and
+    AGENT_COST_PER_MTOK_OUT are set (dollars per million tokens). Keeping
+    this opt-in means we never publish a cost figure derived from a price
+    we guessed — check Anthropic's current pricing and set the env vars if
+    you want dollars alongside the token counts.
+    """
+    try:
+        rate_in = float(os.getenv("AGENT_COST_PER_MTOK_IN", "") or "")
+        rate_out = float(os.getenv("AGENT_COST_PER_MTOK_OUT", "") or "")
+        n_in = float(in_tokens or 0)
+        n_out = float(out_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    return (n_in / 1_000_000.0) * rate_in + (n_out / 1_000_000.0) * rate_out
 
 
 def extract_json_block(text: str) -> Optional[Dict[str, Any]]:
@@ -140,4 +203,4 @@ def extract_json_block(text: str) -> Optional[Dict[str, Any]]:
             continue
 
 
-__all__ = ["call", "extract_json_block", "DEFAULT_MODEL"]
+__all__ = ["call", "extract_json_block", "DEFAULT_MODEL", "LAST_USAGE"]

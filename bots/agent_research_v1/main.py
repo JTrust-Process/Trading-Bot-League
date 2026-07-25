@@ -203,6 +203,17 @@ def run_cycle() -> str:
         print(f"[agent] proposals (after sanitization): {len(proposals)}")
 
         # 4. Write the brief as an AGENT_BRIEF event.
+        #    llm.LAST_USAGE carries the token counts Anthropic reported for
+        #    this cycle's call (added 2026-07-25). Persisting it makes this
+        #    bot's actual spend queryable instead of estimated —
+        #    bot_expenses had been asserting "~$0.003/run" with nothing
+        #    behind it. Query with:
+        #      select occurred_at,
+        #             metadata->'usage'->>'input_tokens'  as in_tok,
+        #             metadata->'usage'->>'output_tokens' as out_tok
+        #      from bot_events
+        #      where bot_id = 'agent_research_v1' and event_type = 'AGENT_BRIEF'
+        #      order by occurred_at desc;
         league.log_event(
             "AGENT_BRIEF",
             message=brief or "(no narrative)",
@@ -211,6 +222,7 @@ def run_cycle() -> str:
                 "proposal_count": len(proposals),
                 "model":          os.getenv("AGENT_MODEL", llm.DEFAULT_MODEL),
                 "context_chars":  len(compact),
+                "usage":          dict(llm.LAST_USAGE),
             },
             run_id=run_id,
         )
