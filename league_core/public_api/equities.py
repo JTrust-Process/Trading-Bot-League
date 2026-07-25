@@ -53,6 +53,28 @@ which is strictly stronger: it is documented behavior, and it also
 surfaces cost/fee estimates. If Public later documents `useMargin`,
 adding it is a one-line change in `_build_payload`.
 
+OBSERVED RESPONSE SHAPE (probed live 2026-07-25, account 5OG08899):
+
+    SPY  $5 EQUITY -> orderValue 5.00, estimatedCost 5.00,
+                      buyingPowerRequirement 5.00, commission 0.00
+    BTC  $5 CRYPTO -> orderValue 5.00, estimatedCost 5.03,
+                      buyingPowerRequirement 5.03, commission 0.03
+                      (0.60% crypto fee tier, included in estimatedCost)
+
+  * CRYPTO **is** supported by the single-leg preflight endpoint even
+    though the docs describe it in equity/options terms.
+  * `marginImpact`, `marginRequirement`, `regulatoryFees` and
+    `shortSelling` all came back **null** on this account, which is a
+    CASH account — portfolio v2 reports
+    cashOnlyBuyingPower == buyingPower == optionsBuyingPower.
+
+  So on a cash account the margin-detection branch below can never
+  fire; the guard that actually does the work is
+  `buyingPowerRequirement > cashOnlyBuyingPower`. The margin checks are
+  retained deliberately: they cost nothing, they fail open (null ->
+  None -> no block), and they become live the moment margin is enabled
+  on an account. Do not mistake them for the active protection today.
+
 Env flags:
   EQUITIES_PREFLIGHT         'true' (default) — run preflight before orders.
   EQUITIES_CASH_ONLY         'true' (default) — refuse orders that would
