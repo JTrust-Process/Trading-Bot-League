@@ -9,11 +9,17 @@ Exercises the OFFLINE paths only:
   * _build_payload shape matches the live stock bot's wire format
   * place_market_buy / place_market_sell with dry_run=True return the
     expected structured result without touching the network
+  * _evaluate_preflight — the PURE pre-trade safety rules engine
+    (margin detection, cash-only buying power, shortability, and
+    tolerance of missing/garbage fields)
+  * _env_flag parsing
+  * dry-run is unaffected by the preflight env flags
 
 The ONLINE paths (auth.get_access_token, auth.get_account_id, _post_order,
-get_fill_price) are exercised when you place a real order in your first
-live ETF cycle. If anything is wrong there, you'll see it in the bot_runs /
-bot_errors tables for that cycle — pull the plug via LEAGUE_KILL=1 if so.
+preflight_single_leg, get_cash_only_buying_power, get_fill_price) are
+exercised when you place a real order in a live cycle. If anything is
+wrong there, you'll see it in the bot_runs / bot_errors tables for that
+cycle — pull the plug via LEAGUE_KILL=1 if so.
 """
 
 from __future__ import annotations
@@ -138,6 +144,133 @@ def main() -> int:
     fails += _check("env PUBLIC_DRY_RUN=1 triggers dry_run",
                     True, res_env["response"]["dry_run"])
     os.environ.pop("PUBLIC_DRY_RUN", None)
+
+    # ── _evaluate_preflight (pure; no network) ─────────────────────────────
+    print("-" * 50)
+    print("pre-trade safety — _evaluate_preflight")
+
+    def _pf(**over):
+        """A clean cash-funded BUY preflight response."""
+        base = {
+            "instrument": {"symbol": "SPY", "type": "EQUITY"},
+            "orderValue": "250.00",
+            "estimatedCost": "250.00",
+            "estimatedQuantity": "0.335",
+            "buyingPowerRequirement": "250.00",
+            "estimatedCommission": "0.00",
+            "regulatoryFees": {"secFee": "0.00", "tafFee": "0.00"},
+            "marginImpact": {"marginUsageImpact": "0.00",
+                             "initialMarginRequirement": "0.00"},
+            "marginRequirement": {"longInitialRequirement": "0.00",
+                                  "longMaintenanceRequirement": "0.00"},
+        }
+        base.update(over)
+        return base
+
+    ok, reason, det = equities._evaluate_preflight(
+        _pf(), side="BUY", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("clean cash BUY allowed", (True, equities.PRE_OK), (ok, reason))
+    fails += _check("details carry estimated_cost", 250.0, det["estimated_cost"])
+    fails += _check("details carry buying_power_requirement",
+                    250.0, det["buying_power_requirement"])
+
+    # Margin signals must block when cash_only=True.
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(marginImpact={"marginUsageImpact": "125.00",
+                          "initialMarginRequirement": "0.00"}),
+        side="BUY", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("marginUsageImpact>0 blocks",
+                    (False, equities.PRE_MARGIN_REQUIRED), (ok, reason))
+
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(marginImpact={"marginUsageImpact": "0.00",
+                          "initialMarginRequirement": "50.00"}),
+        side="BUY", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("initialMarginRequirement>0 blocks",
+                    (False, equities.PRE_MARGIN_REQUIRED), (ok, reason))
+
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(marginRequirement={"longInitialRequirement": "75.00"}),
+        side="BUY", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("longInitialRequirement>0 blocks",
+                    (False, equities.PRE_MARGIN_REQUIRED), (ok, reason))
+
+    # Same margin signal must NOT block when cash_only=False.
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(marginImpact={"marginUsageImpact": "125.00"}),
+        side="BUY", cash_only=False, cash_buying_power=1000.0)
+    fails += _check("cash_only=False permits margin",
+                    (True, equities.PRE_OK), (ok, reason))
+
+    # Requirement exceeding cash-only buying power blocks.
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(buyingPowerRequirement="500.00"),
+        side="BUY", cash_only=True, cash_buying_power=250.0)
+    fails += _check("requirement > cash BP blocks",
+                    (False, equities.PRE_INSUFFICIENT_CASH), (ok, reason))
+
+    # Exactly equal is allowed (boundary).
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(buyingPowerRequirement="250.00"),
+        side="BUY", cash_only=True, cash_buying_power=250.0)
+    fails += _check("requirement == cash BP allowed (boundary)",
+                    (True, equities.PRE_OK), (ok, reason))
+
+    # Unknown cash buying power must not block on its own.
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(buyingPowerRequirement="500.00"),
+        side="BUY", cash_only=True, cash_buying_power=None)
+    fails += _check("unknown cash BP does not block",
+                    (True, equities.PRE_OK), (ok, reason))
+
+    # NOT_SHORTABLE blocks a SELL.
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(shortSelling={"availability": "NOT_SHORTABLE"}),
+        side="SELL", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("NOT_SHORTABLE blocks SELL",
+                    (False, equities.PRE_NOT_SHORTABLE), (ok, reason))
+
+    # ...but an ordinary SELL with no shortSelling block is fine.
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(), side="SELL", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("ordinary SELL allowed",
+                    (True, equities.PRE_OK), (ok, reason))
+
+    # Missing/garbage fields must not crash and must not spuriously block.
+    ok, reason, _ = equities._evaluate_preflight(
+        {}, side="BUY", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("empty preflight body does not block",
+                    (True, equities.PRE_OK), (ok, reason))
+
+    ok, reason, _ = equities._evaluate_preflight(
+        _pf(buyingPowerRequirement="not-a-number",
+            marginImpact={"marginUsageImpact": "junk"}),
+        side="BUY", cash_only=True, cash_buying_power=1000.0)
+    fails += _check("unparseable numerics do not block",
+                    (True, equities.PRE_OK), (ok, reason))
+
+    # ── _env_flag ──────────────────────────────────────────────────────────
+    os.environ.pop("SMOKE_TEST_FLAG", None)
+    fails += _check("_env_flag unset -> default True",
+                    True, equities._env_flag("SMOKE_TEST_FLAG", True))
+    fails += _check("_env_flag unset -> default False",
+                    False, equities._env_flag("SMOKE_TEST_FLAG", False))
+    os.environ["SMOKE_TEST_FLAG"] = "false"
+    fails += _check("_env_flag 'false' overrides default True",
+                    False, equities._env_flag("SMOKE_TEST_FLAG", True))
+    os.environ["SMOKE_TEST_FLAG"] = "yes"
+    fails += _check("_env_flag 'yes' is truthy",
+                    True, equities._env_flag("SMOKE_TEST_FLAG", False))
+    os.environ.pop("SMOKE_TEST_FLAG", None)
+
+    # ── Dry-run must NOT be affected by preflight settings ─────────────────
+    os.environ["EQUITIES_PREFLIGHT"] = "true"
+    os.environ["EQUITIES_CASH_ONLY"] = "true"
+    res_dry = equities.place_market_buy("SPY", 250.0, dry_run=True)
+    fails += _check("dry_run bypasses preflight (still ok)", True, res_dry["ok"])
+    fails += _check("dry_run has no pre_trade key", False, "pre_trade" in res_dry)
+    os.environ.pop("EQUITIES_PREFLIGHT", None)
+    os.environ.pop("EQUITIES_CASH_ONLY", None)
 
     # ── Done ───────────────────────────────────────────────────────────────
     print("=" * 50)
