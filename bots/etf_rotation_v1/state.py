@@ -26,16 +26,12 @@ import os
 from typing import Any, Dict
 
 from league_core import status as league
+from league_core import common
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
+# Consolidated into league_core.common 2026-07-25 (was duplicated here and
+# in main.py within this same bot, plus short_watchlist_v1).
+_env_float = common.env_float
 
 
 def default_state(paper_capital: float) -> Dict[str, Any]:

@@ -226,7 +226,19 @@ _ETF_SYMBOLS = frozenset({
 
 
 def _classify(symbol: str) -> str:
-    return "etf" if (symbol or "").upper() in _ETF_SYMBOLS else "equity"
+    """Asset class for the League's bot_trades mirror.
+
+    Prefers league_core.common's canonical list (2026-07-25 consolidation —
+    three bots had three different ETF allowlists, so the same ticker got a
+    different asset_class depending on which one logged it). Falls back to
+    the local _ETF_SYMBOLS set if league_core isn't importable, since this
+    module is vendored and must keep working standalone.
+    """
+    try:
+        from league_core import common  # noqa: WPS433 - optional dependency
+        return common.classify_asset_class(symbol)
+    except Exception:  # noqa: BLE001
+        return "etf" if (symbol or "").upper() in _ETF_SYMBOLS else "equity"
 
 
 def log_trade(

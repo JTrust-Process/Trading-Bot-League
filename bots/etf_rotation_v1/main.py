@@ -43,6 +43,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from league_core import status as league
+from league_core import common
 from league_core import risk
 from league_core.public_api import equities
 from league_core.public_bars import get_public_bars, latest_close
@@ -53,14 +54,9 @@ from bots.etf_rotation_v1 import state as bot_state
 # ── Config (env-driven) ─────────────────────────────────────────────────────
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
+# Env helpers consolidated into league_core.common 2026-07-25 — this exact
+# body existed here, in state.py, and in short_watchlist_v1/main.py.
+_env_float = common.env_float
 
 
 PAPER_CAPITAL_DEFAULT = _env_float("ETF_PAPER_CAPITAL", 1000.0)

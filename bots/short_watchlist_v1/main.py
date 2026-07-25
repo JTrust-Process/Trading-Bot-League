@@ -71,6 +71,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from league_core import status as league
+from league_core import common
 from league_core.public_bars import get_public_bars
 from bots.short_watchlist_v1 import screener
 from bots.short_watchlist_v1 import state as bot_state
@@ -79,14 +80,10 @@ from bots.short_watchlist_v1 import state as bot_state
 # ── Config ──────────────────────────────────────────────────────────────────
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
+# Env helpers live in league_core.common as of 2026-07-25 (they were
+# duplicated across three bots under three different names). Aliased here
+# so the rest of this module reads unchanged.
+_env_float = common.env_float
 
 
 CAPITAL_PER_TRADE = _env_float("SHORT_CAPITAL_PER_TRADE", 100.0)
@@ -101,17 +98,14 @@ SYMBOLS = (
 
 # ── Entry gates (added 2026-07-24; see module docstring for rationale) ─────
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "on")
+_env_bool = common.env_bool
 
-
-REGIME_GATE_ENABLED = _env_bool("SHORT_REGIME_GATE",  True)
-REGIME_SMA_PERIOD   = int(os.getenv("SHORT_REGIME_SMA", "200") or "200")
-MIN_CONFIDENCE      = _env_float("SHORT_MIN_CONFIDENCE",    0.70)
-REL_WEAKNESS_PCT    = _env_float("SHORT_REL_WEAKNESS_PCT",  0.05)
+REGIME_GATE_ENABLED = common.env_bool("SHORT_REGIME_GATE",  True)
+# env_int tolerates "200.0" — hand-edited env vars land that way sometimes,
+# and the old int(...) form would have silently fallen back to the default.
+REGIME_SMA_PERIOD   = common.env_int("SHORT_REGIME_SMA",    200)
+MIN_CONFIDENCE      = common.env_float("SHORT_MIN_CONFIDENCE",   0.70)
+REL_WEAKNESS_PCT    = common.env_float("SHORT_REL_WEAKNESS_PCT", 0.05)
 
 
 def _utcnow_iso() -> str:
@@ -122,10 +116,15 @@ def _utcnow_iso() -> str:
 
 
 def _classify(symbol: str) -> str:
-    """Mirror the ETF bot's tiny allow-list — anything not an ETF defaults
-    to 'equity' so bot_trades.asset_class is informative."""
-    etfs = {"QQQ", "SPY", "IWM", "XLK"}
-    return "etf" if symbol in etfs else "equity"
+    """Asset class for bot_trades / bot_positions.
+
+    Delegates to league_core.common (2026-07-25). This used to carry its own
+    four-symbol allowlist {QQQ, SPY, IWM, XLK}, while options_alert_v1 had a
+    three-symbol one and stock_momentum_v1 had thirty — so the SAME ticker
+    was recorded with a different asset_class depending on which bot logged
+    it, corrupting any cross-bot grouping. One list now.
+    """
+    return common.classify_asset_class(symbol)
 
 
 def _open_paper_short(

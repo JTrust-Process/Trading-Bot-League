@@ -34,6 +34,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from league_core import status as league
+from league_core import common
 from league_core.public_bars import get_public_bars
 from bots.options_alert_v1 import screener
 
@@ -52,8 +53,10 @@ SYMBOLS: tuple[str, ...] = (
 
 
 def _classify(symbol: str) -> str:
-    etfs = {"SPY", "QQQ", "IWM"}
-    return "etf" if symbol in etfs else "equity"
+    """Asset class for bot_signals. Delegates to league_core.common
+    (2026-07-25) — see short_watchlist_v1.main._classify for why the
+    per-bot allowlists were consolidated."""
+    return common.classify_asset_class(symbol)
 
 
 def run_cycle() -> str:
