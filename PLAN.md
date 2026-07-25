@@ -1,8 +1,40 @@
 # League of Trading Bots — v1 Architecture & Implementation Plan
 
-**Status:** Draft v1 for review. No code changes have been made. Awaiting approval before any implementation step.
+**Status:** LARGELY IMPLEMENTED as of 2026-07-24. This document is now a
+historical / architectural reference rather than a forward plan. See the
+memory files under `spaces/*/memory/` and `SESSION_2026-07-24_SUMMARY.md`
+(if still present) for current state. Highlights of what shipped vs the
+original plan:
 
-**Date:** 2026-05-10
+- Stages 0-4 (League Supabase project, `bot_registry` / `bot_status` /
+  `bot_runs` schema, `league_status.py` adapter, dashboard `/league`
+  route): **done**
+- Stage 5 first paper bot (`etf_rotation_v1`): **done**, and further
+  promoted to LIVE 2026-06 (mode='live'), dormant since (no regime
+  change to trigger a rebalance in the persistent bull market)
+- Stage 6 scheduler consolidation onto Fly: **done via `agent_runner`**
+  (see `agent_runner/README.md`). GHA schedules for all League bots
+  disabled 2026-07-24
+- Stage 7 live-bot migration to Fly: **done 2026-07-24** — stock and
+  crypto now run on the same Fly agent_runner as the paper/research bots
+- Additional bots that shipped: `bond_research_v1` (research-only,
+  scoring 8 bonds daily), `short_watchlist_v1` (paper-only, entry gates
+  hardened 2026-07-24), `agent_research_v1` (AI research bot, running
+  daily)
+- Bots that were built but deprecated: `public_shadow_v1` (2026-05-28,
+  after account 2 was repurposed off-platform), `options_alert_v1`
+  (2026-07-24, family-level signals with no execution path — superseded
+  by future `options_paper_v1` on Public's new options API surface)
+- Risk gate (`league_core/risk.py`) and equities order client
+  (`league_core/public_api/equities.py`): **built and in use by ETF live
+  path**; stock/crypto bots still use their own internal risk (defense
+  in depth, no rewrite needed for the cutover)
+
+For the current active roadmap and open items, see the "What's still
+open" section in `SESSION_2026-07-24_SUMMARY.md` and the paper/research
+bot audit memory.
+
+**Original document date:** 2026-05-10
 
 ---
 

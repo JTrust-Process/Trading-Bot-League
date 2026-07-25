@@ -1,11 +1,16 @@
 name: Short Watchlist v1 (paper)
 
 on:
-  schedule:
-    # Hourly during US market hours, Mon-Fri.
-    # Offset minute :41 to avoid colliding with stock (:17), crypto
-    # (:07/:22/:37/:52), etf (:33), bond (:35), league_health (:09/:24/:39/:54).
-    - cron: "41 14-20 * * 1-5"
+  # DISABLED 2026-07-24 — this bot runs on the Fly agent_runner now, not
+  # GHA. Rollback path: uncomment the schedule block below AND remove the
+  # short_watchlist_v1 add_job block from agent_runner/scheduler.py.
+  # workflow_dispatch stays for emergency manual runs.
+  #
+  # schedule:
+  #   # Hourly during US market hours, Mon-Fri.
+  #   # Offset minute :41 to avoid colliding with stock (:17), crypto
+  #   # (:07/:22/:37/:52), etf (:33), bond (:35), league_health (:09/:24/:39/:54).
+  #   - cron: "41 14-20 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:

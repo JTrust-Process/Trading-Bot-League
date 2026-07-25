@@ -1,11 +1,18 @@
 name: Options Alert v1 (research-only)
 
 on:
-  schedule:
-    # Once per day at 14:37 UTC. Daily-bar inputs only refresh daily.
-    # Offset minute :37 to avoid collisions with stock (:17), crypto
-    # (:07/:22/:37/:52)... actually crypto runs at :37, so let's pick :43.
-    - cron: "43 14 * * 1-5"
+  # DISABLED 2026-07-24 — bot itself was deprecated (see
+  # bots/options_alert_v1/README.md); this cron was ALSO still firing
+  # via GHA in parallel to the Fly agent_runner. Fully disabled here
+  # too. Rollback path (unlikely — bot is superseded by future
+  # options_paper_v1): uncomment the schedule block AND restore the
+  # scheduler.py add_job AND flip bot_registry.status back to 'enabled'.
+  #
+  # schedule:
+  #   # Once per day at 14:37 UTC. Daily-bar inputs only refresh daily.
+  #   # Offset minute :37 to avoid collisions with stock (:17), crypto
+  #   # (:07/:22/:37/:52)... actually crypto runs at :37, so let's pick :43.
+  #   - cron: "43 14 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:

@@ -26,10 +26,11 @@ insert into public.bot_registry (
   notes
 ) values (
   'options_alert_v1',
-  'Options Alert v1 (research-only)',
+  'Options Alert v1 (research-only, DEPRECATED)',
   'options',
   'research',
-  'enabled',
+  'disabled',      -- DISABLED 2026-07-24: family-level suggestions with no
+                    -- downstream consumer; superseded by future options_paper_v1
   ARRAY['SPY','QQQ','IWM','AAPL','NVDA','TSLA'],
   false,           -- never trades
   true,            -- approval required if signals are ever consumed by a trader
@@ -37,11 +38,16 @@ insert into public.bot_registry (
   0,
   0,
   'jeremiahallu13@gmail.com',
-  'Research-only options strategy suggester. Maps (trend regime × vol '
-    || 'regime) to a defined-risk strategy family per underlying. Publishes '
-    || 'one options_idea signal per symbol per cycle with approval_required=true. '
-    || 'Cannot be promoted to live in place — would need a separate '
-    || 'options_paper_v1 -> options_v1 pair built on real chain data.'
+  'DEPRECATED 2026-07-24. Originally: research-only options strategy '
+    || 'suggester mapping (trend × vol regime) to defined-risk strategy '
+    || 'families. Disabled because it produces family-level signals with '
+    || 'no strikes/expirations/greeks and no downstream execution '
+    || 'consumer — 606 signals in 72 days growing bot_signals for no '
+    || 'benefit. Superseded by future options_paper_v1 (not yet built) '
+    || 'using Public options-chain, greeks, strategy-quote, and multi-leg '
+    || 'placement endpoints. Bot code remains in bots/options_alert_v1/ '
+    || 'for reference. To revive: flip status back to enabled and '
+    || 'restore the add_job block in agent_runner/scheduler.py.'
 )
 on conflict (bot_id) do update set
   bot_name                 = excluded.bot_name,

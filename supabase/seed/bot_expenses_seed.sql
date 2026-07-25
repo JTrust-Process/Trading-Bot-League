@@ -57,17 +57,27 @@ on conflict (coalesce(bot_id, '__league__'), category, period) do update set
   note       = excluded.note;
 
 -- ---------------------------------------------------------------------------
--- Claude subscription — Claude Pro/Max for Claude Desktop & MCP server.
--- Edit this row with your actual subscription tier once you confirm it.
--- League-wide (used by interactive sessions across both accounts).
+-- Claude subscription — Claude Pro/Max.
+--
+-- Attribution corrected 2026-07-24. Originally this row cited "interactive
+-- AI trading via Claude Desktop MCP server" as the justification. That was
+-- fiction — the MCP server was never set up. What Claude Pro actually
+-- funds for the League: interactive dev/chat sessions (this whole audit
+-- session, code review, drafting bot code, running SQL manually against
+-- Supabase, etc.). If you ever set up Public's hosted MCP for ChatGPT/
+-- Claude and use it as a portfolio-query / manual-trigger surface,
+-- re-attribute this line accordingly.
+--
 -- Defaulting to $20/mo (Pro tier). Change to 100 or 200 if on Max.
 -- ---------------------------------------------------------------------------
 insert into public.bot_expenses (
   bot_id, category, amount_usd, period, recurring, note
 ) values
   (NULL, 'claude_subscription', 20.00, '2026-05', true,
-   'Claude Pro — interactive AI trading via Claude Desktop MCP server. '
-   || 'Update if subscription tier changes.')
+   'Claude Pro — dev/chat sessions for building and maintaining the '
+   || 'League (code review, SQL, docs, manual ops). No MCP server '
+   || 'in play as of 2026-07-24. Update if subscription tier or usage '
+   || 'attribution changes.')
 on conflict (coalesce(bot_id, '__league__'), category, period) do update set
   amount_usd = excluded.amount_usd,
   recurring  = excluded.recurring,

@@ -1,14 +1,20 @@
 name: Agent Research v1 (AI, research-only)
 
 on:
-  schedule:
-    # Once per day at 14:50 UTC (10:50 ET during EDT). Runs after the
-    # other research bots (bond at :35, options at :43) so the agent's
-    # snapshot includes their latest output.
-    # Offset minute :50 to avoid every other cron slot in use:
-    #  :07/:22/:37/:52 crypto, :09/:24/:39/:54 league_health,
-    #  :17 stock, :33 etf, :35 bond, :41 short, :43 options.
-    - cron: "50 14 * * 1-5"
+  # DISABLED 2026-07-24 — this bot runs on the Fly agent_runner now, not
+  # GHA. Rollback path: uncomment the schedule block below AND remove the
+  # agent_research_v1 add_job block from agent_runner/scheduler.py.
+  # workflow_dispatch stays for emergency manual runs. Also worth noting:
+  # the duplicate cron was doubling Anthropic API cost until 2026-07-24.
+  #
+  # schedule:
+  #   # Once per day at 14:50 UTC (10:50 ET during EDT). Runs after the
+  #   # other research bots (bond at :35, options at :43) so the agent's
+  #   # snapshot includes their latest output.
+  #   # Offset minute :50 to avoid every other cron slot in use:
+  #   #  :07/:22/:37/:52 crypto, :09/:24/:39/:54 league_health,
+  #   #  :17 stock, :33 etf, :35 bond, :41 short, :43 options.
+  #   - cron: "50 14 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:

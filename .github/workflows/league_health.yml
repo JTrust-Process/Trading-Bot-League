@@ -1,10 +1,15 @@
 name: League Health
 
 on:
-  schedule:
-    # Offset 9 minutes past so it doesn't collide with bot crons that run at
-    # :07/:17/:22/:37/:52. Pings Discord on state transitions only.
-    - cron: "9,24,39,54 * * * *"
+  # DISABLED 2026-07-24 — league_health runs on the Fly agent_runner
+  # now, not GHA. Rollback path: uncomment the schedule block below AND
+  # remove the league_health add_job block from agent_runner/scheduler.py.
+  # workflow_dispatch stays for emergency manual runs.
+  #
+  # schedule:
+  #   # Offset 9 minutes past so it doesn't collide with bot crons that run at
+  #   # :07/:17/:22/:37/:52. Pings Discord on state transitions only.
+  #   - cron: "9,24,39,54 * * * *"
   workflow_dispatch: {}
 
 concurrency:
