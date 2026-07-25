@@ -240,11 +240,21 @@ def build_scheduler() -> BlockingScheduler:
         trigger=CronTrigger.from_crontab("35 14 * * 1-5", timezone="UTC"),
         id="bond_research_v1", name="bond_research_v1 (daily)",
     )
-    sched.add_job(
-        _run_bot, args=("options_alert_v1", "bots.options_alert_v1.main"),
-        trigger=CronTrigger.from_crontab("43 14 * * 1-5", timezone="UTC"),
-        id="options_alert_v1", name="options_alert_v1 (daily)",
-    )
+    # ── options_alert_v1 — DISABLED 2026-07-24 ─────────────────────────────
+    # The bot was producing 1.4 signals/symbol/day of family-level ideas
+    # ("SPY bull/mid_vol → bull_put_spread") with no downstream consumer
+    # and no contract-level specifics — pure noise growing bot_signals
+    # daily. Superseded by a future options_paper_v1 (not built) that
+    # will use Public's new option-chain, greeks, strategy-quote, and
+    # multi-leg placement endpoints (added Feb-May 2026, after this bot
+    # was designed). Bot code stays in bots/options_alert_v1/ for
+    # reference; flip bot_registry.status back to 'enabled' and restore
+    # this add_job block from git history to re-activate.
+    # sched.add_job(
+    #     _run_bot, args=("options_alert_v1", "bots.options_alert_v1.main"),
+    #     trigger=CronTrigger.from_crontab("43 14 * * 1-5", timezone="UTC"),
+    #     id="options_alert_v1", name="options_alert_v1 (daily)",
+    # )
     sched.add_job(
         _run_bot, args=("agent_research_v1", "bots.agent_research_v1.main"),
         trigger=CronTrigger.from_crontab("50 14 * * 1-5", timezone="UTC"),

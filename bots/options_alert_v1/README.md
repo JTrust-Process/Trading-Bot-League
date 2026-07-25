@@ -1,5 +1,34 @@
 # options_alert_v1
 
+> ## ⚠ DEPRECATED 2026-07-24
+>
+> This bot has been disabled — its scheduler job in
+> `agent_runner/scheduler.py` is commented out and its `bot_registry`
+> row status is `disabled`. Code stays here for reference and possible
+> revival.
+>
+> **Why:** the bot outputs family-level strategy suggestions
+> ("SPY: bull/mid_vol → bull_put_spread") with no strikes,
+> expirations, greeks, or premium quotes. Zero downstream execution
+> consumer. Public shipped real options endpoints (option-chain, greeks,
+> strategy-quote, multi-leg placement) between Feb-May 2026 — the
+> right path forward is a from-scratch `options_paper_v1` built on
+> those endpoints, not polish on a bot whose design predates the
+> capability.
+>
+> **To revive** temporarily (e.g., you want the daily family-level
+> ideas back while you build the real bot): restore the `add_job` block
+> in `agent_runner/scheduler.py` from git history and flip
+> `bot_registry.status` back to `'enabled'`. No other change needed.
+>
+> **The real future bot** — `options_paper_v1` — would keep the
+> current strategy-matrix logic (bull/bear/mixed × low/mid/high) to
+> pick a family, then use Public's chain/greeks/strategy-quote endpoints
+> to pick actual strikes and simulate real fills. Scope separately when
+> ready. See the migration memory for context.
+
+---
+
 **Research-only.** Never trades, never simulates trades, never imports an
 order endpoint. Publishes options-strategy ideas to `bot_signals` so a
 human (or a future agent bot) can decide whether to act on any of them.

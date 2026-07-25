@@ -10,7 +10,6 @@ GitHub Actions free minutes.
 | Job | Schedule | Source |
 |---|---|---|
 | `bond_research_v1`    | weekday 14:35 UTC                              | `bots.bond_research_v1.main`    |
-| `options_alert_v1`    | weekday 14:43 UTC                              | `bots.options_alert_v1.main`    |
 | `agent_research_v1`   | weekday 14:50 UTC                              | `bots.agent_research_v1.main`   |
 | `etf_rotation_v1`     | weekday hourly 14-20 UTC at :33                | `bots.etf_rotation_v1.main`     |
 | `short_watchlist_v1`  | weekday hourly 14-20 UTC at :41                | `bots.short_watchlist_v1.main`  |
@@ -23,6 +22,15 @@ disabled 2026-05-28 (account #2 reassigned off-platform; Claude MCP path
 dropped). Bot code remains in `bots/public_shadow_v1/` for future revival;
 to re-enable, restore the `add_job` block in `scheduler.py` from git
 history and flip `bot_registry.status` back to `'enabled'`.
+
+`options_alert_v1` was previously scheduled daily at 14:43 UTC. It was
+disabled 2026-07-24 — the bot produced family-level suggestions with
+no strikes/expirations/greeks and no downstream consumer, growing
+`bot_signals` daily for no benefit. Superseded by a future
+`options_paper_v1` (not yet built) using Public's option-chain,
+greeks, strategy-quote, and multi-leg placement endpoints (added
+Feb-May 2026). Bot code remains in `bots/options_alert_v1/` for
+reference; revive via the same restore pattern as public_shadow_v1.
 
 `stock_momentum_v1` and `crypto_ema_atr_v1` were vendored into this repo
 on 2026-06-01 as part of the GHA → Fly migration. They are **gated
