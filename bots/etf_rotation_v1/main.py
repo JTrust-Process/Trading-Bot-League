@@ -228,6 +228,10 @@ def _live_open_position(
 
     qty = dollars / fill_price
 
+    # Preflight estimates (cost, fees, buying-power requirement) come back
+    # on result["pre_trade"]. Persist them alongside the trade so the
+    # economics are queryable in Supabase rather than living only in
+    # ephemeral Fly logs. See league_core/public_api/equities.py.
     league.log_trade(
         symbol=symbol, side="BUY", asset_class="etf",
         quantity=qty, price=fill_price, amount_usd=dollars,
@@ -236,6 +240,7 @@ def _live_open_position(
         metadata={
             "fill_price_estimated": estimated,
             "dry_run":              is_dry,
+            "pre_trade":            result.get("pre_trade") or {},
         },
     )
     league.upsert_position(
@@ -300,6 +305,7 @@ def _live_close_position(
         pnl_usd = 0.0
         pnl_pct = 0.0
 
+    # See _live_open_position for why pre_trade is persisted here.
     league.log_trade(
         symbol=symbol, side="SELL", asset_class="etf",
         quantity=qty, price=exit_price,
@@ -310,6 +316,7 @@ def _live_close_position(
         metadata={
             "fill_price_estimated": estimated,
             "dry_run":              is_dry,
+            "pre_trade":            result.get("pre_trade") or {},
         },
     )
     league.close_position(

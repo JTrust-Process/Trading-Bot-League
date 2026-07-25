@@ -57,6 +57,23 @@ STOP_FILE = "STOP.txt"
 supabase = None
 _last_regime: str | None = None  # track regime changes for notifications
 
+# Preflight estimates handoff (added 2026-07-25).
+#
+# pre_trade_check_buy() computes cost / fee / buying-power estimates from
+# Public's preflight response. log_trade() mirrors trades into the League's
+# bot_trades table, which HAS a jsonb metadata column — so we stash the
+# estimates here keyed by symbol and attach them at log time.
+#
+# Why a module-level handoff rather than a parameter: log_trade() is called
+# from ~8 sites across the exit paths and threading a new argument through
+# all of them is churn with more risk than value. Entries are POPPED on read
+# so a stale estimate can never attach to a later trade.
+#
+# Note the bot's OWN `trades` table has a fixed schema with no jsonb column;
+# these estimates therefore land only in the League mirror. Adding them to
+# the bot's own project would need a migration.
+_LAST_PREFLIGHT: Dict[str, Any] = {}
+
 def _load_last_regime_from_supabase() -> Optional[str]:
     """Load last known regime from Supabase to avoid UNKNOWN → X spam on GHA restarts."""
     global supabase
@@ -357,6 +374,9 @@ def log_trade(
     # so bot_trades.price always reflects the side's fill price.
     try:
         is_buy = (side or "").upper() == "BUY"
+        # Attach preflight estimates when we have them for this symbol.
+        # POP so a stale estimate can never bind to a later trade.
+        pre_trade = _LAST_PREFLIGHT.pop((symbol or "").upper(), None)
         league_status.log_trade(
             symbol=symbol,
             side=side,
@@ -366,6 +386,7 @@ def log_trade(
             pnl_pct=(None if is_buy else pnl_pct),
             strategy=strategy,
             is_paper=False,  # this code path only runs in live mode (asserted in main())
+            metadata=({"pre_trade": pre_trade} if pre_trade else None),
         )
     except Exception:
         pass
@@ -1099,6 +1120,11 @@ class PublicClient:
 
         cash_bp = self._cash_only_buying_power() if cash_only else None
         d = self._preflight_details(pf["body"] or {}, cash_bp)
+        # Stash for log_trade() to attach to the League bot_trades row.
+        # Set BEFORE the refusal checks below so a blocked order still
+        # leaves evidence of why in the logs; the entry is popped on read
+        # and simply expires unused if no trade follows.
+        _LAST_PREFLIGHT[(symbol or "").upper()] = d
         print_status(
             "PREFLIGHT_BUY",
             f"{symbol} cost={d['estimated_cost']} bpr={d['buying_power_requirement']} "

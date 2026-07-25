@@ -29,10 +29,40 @@ from crypto_bot.logging._supabase import get_client, now_iso
 _TABLE = "bot_state"
 
 
+_logged_key = False
+
+
 def _key() -> str:
     """The state row's primary key. Distinct per branch in CI so a feature
-    branch run can't clobber main's state. Locally, falls back to 'default'."""
-    return os.getenv("GITHUB_REF_NAME") or os.getenv("STATE_KEY") or "default"
+    branch run can't clobber main's state. Falls back to 'default'.
+
+    GOTCHA (bit us 2026-07-24). `GITHUB_REF_NAME` is injected automatically
+    by GitHub Actions and equals the branch name — so on GHA this resolved
+    to 'main'. When the bot moved to Fly that variable no longer exists, the
+    chain fell through to 'default', and the bot silently began writing a
+    BRAND NEW state row: price history reset to zero, position tracking
+    reset, and the accumulated `main` row orphaned. Nothing errored. The
+    only visible symptom was the dashboard reporting "warming up regime
+    filter (42/55 prices)" for a bot that had been running since March.
+
+    Set STATE_KEY explicitly in any non-GHA environment. On Fly that means
+    CRYPTO_STATE_KEY (the agent_runner scheduler strips the CRYPTO_ prefix
+    per-job), which is set in fly.toml.
+
+    The resolved key is logged once per process so a mismatch is obvious in
+    the logs instead of silently forking state again.
+    """
+    global _logged_key
+    key = os.getenv("GITHUB_REF_NAME") or os.getenv("STATE_KEY") or "default"
+    if not _logged_key:
+        source = (
+            "GITHUB_REF_NAME" if os.getenv("GITHUB_REF_NAME")
+            else "STATE_KEY" if os.getenv("STATE_KEY")
+            else "fallback"
+        )
+        print(f"[state.remote] using bot_state key={key!r} (from {source})")
+        _logged_key = True
+    return key
 
 
 def save_state_to_supabase(state: dict) -> None:

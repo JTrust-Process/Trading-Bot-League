@@ -116,6 +116,14 @@ primary_region = 'iad'
   CRYPTO_ATR_TP_MULTIPLIER        = "4.0"
   CRYPTO_COOLDOWN_CANDLES         = "4"
   CRYPTO_DRY_RUN                  = "0"
+  # Supabase bot_state row key. MUST be set explicitly off GHA.
+  # On GitHub Actions the bot read GITHUB_REF_NAME (auto-injected, = "main").
+  # That variable does not exist on Fly, so after the 2026-07-24 migration the
+  # key silently fell back to "default" and the bot started a fresh state row —
+  # price history and position tracking reset to zero, the accumulated "main"
+  # row orphaned, no error raised. Pinning it here restores continuity.
+  # See crypto_bot/state/remote.py::_key for the full write-up.
+  CRYPTO_STATE_KEY                = "main"
 
 # Notes:
 # - shared-cpu-1x at 256MB is the smallest VM Fly offers. Our service
