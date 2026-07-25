@@ -158,7 +158,7 @@ def start_run(trigger: str = "cron", git_sha: Optional[str] = None) -> Optional[
         "git_sha": (
             git_sha
             or os.getenv("GITHUB_SHA")
-            or os.getenv("FLY_IMAGE_REF")
+            or (os.getenv("FLY_IMAGE_REF") or "").rsplit(":", 1)[-1]
             or os.getenv("FLY_MACHINE_VERSION")
         ),
     }

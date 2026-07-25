@@ -204,10 +204,13 @@ def start_run(trigger: str = "cron", git_sha: Optional[str] = None) -> Optional[
         # bot_runs.git_sha null and made it impossible to tell which deploy
         # a run belonged to. Fall back to Fly's identifiers so the column
         # stays useful wherever the bot runs.
+        # FLY_IMAGE_REF is the full registry URL
+        # ("registry.fly.io/<app>:deployment-<ulid>"); keep only the tag so
+        # the column stays readable. Verified present on Fly 2026-07-25.
         "git_sha": (
             git_sha
             or os.getenv("GITHUB_SHA")
-            or os.getenv("FLY_IMAGE_REF")
+            or (os.getenv("FLY_IMAGE_REF") or "").rsplit(":", 1)[-1]
             or os.getenv("FLY_MACHINE_VERSION")
         ),
     }
