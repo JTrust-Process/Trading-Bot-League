@@ -199,7 +199,17 @@ def start_run(trigger: str = "cron", git_sha: Optional[str] = None) -> Optional[
         "started_at": _now_iso(),
         "status": "running",
         "trigger": trigger,
-        "git_sha": git_sha or os.getenv("GITHUB_SHA"),
+        # Deploy provenance. GITHUB_SHA only exists on GitHub Actions; since
+        # the 2026-07-24 move to Fly it is always absent, which left
+        # bot_runs.git_sha null and made it impossible to tell which deploy
+        # a run belonged to. Fall back to Fly's identifiers so the column
+        # stays useful wherever the bot runs.
+        "git_sha": (
+            git_sha
+            or os.getenv("GITHUB_SHA")
+            or os.getenv("FLY_IMAGE_REF")
+            or os.getenv("FLY_MACHINE_VERSION")
+        ),
     }
     rows = _post(cfg, "bot_runs", [row], return_representation=True)
     if rows is None:

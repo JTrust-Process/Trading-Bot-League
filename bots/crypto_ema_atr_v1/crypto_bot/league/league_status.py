@@ -153,7 +153,14 @@ def start_run(trigger: str = "cron", git_sha: Optional[str] = None) -> Optional[
         "started_at": _now_iso(),
         "status": "running",
         "trigger": trigger,
-        "git_sha": git_sha or os.getenv("GITHUB_SHA"),
+        # See league_core/status.py — GITHUB_SHA is absent on Fly, so fall
+        # back to Fly's identifiers to keep deploy provenance queryable.
+        "git_sha": (
+            git_sha
+            or os.getenv("GITHUB_SHA")
+            or os.getenv("FLY_IMAGE_REF")
+            or os.getenv("FLY_MACHINE_VERSION")
+        ),
     }
     rows = _post(cfg, "bot_runs", [row], return_repr=True)
     if rows is None:
