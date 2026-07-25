@@ -159,6 +159,40 @@ def _list_accounts(headers: dict) -> None:
               f"number={a.get('accountNumber')}  "
               f"status={a.get('status')}")
 
+    # Per-account balances so you can see WHERE THE CAPITAL IS before
+    # pinning PUBLIC_ACCOUNT_ID. Read-only.
+    print("\n--- balances per account (read-only) ---")
+    for a in accounts:
+        if not isinstance(a, dict):
+            continue
+        acct = str(a.get("accountId") or "")
+        atype = a.get("accountType")
+        if not acct:
+            continue
+        try:
+            r = requests.get(
+                PORTFOLIO_URL_TMPL.format(account_id=acct),
+                headers=headers, timeout=20,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"  {acct} ({atype}): request failed {e!r}")
+            continue
+        if r.status_code != 200:
+            print(f"  {acct} ({atype}): status {r.status_code}")
+            continue
+        try:
+            body = r.json() or {}
+        except ValueError:
+            print(f"  {acct} ({atype}): non-JSON response")
+            continue
+        bp = body.get("buyingPower") or {}
+        equity = body.get("equity") or body.get("totalEquity")
+        positions = body.get("positions")
+        n_pos = len(positions) if isinstance(positions, list) else "?"
+        print(f"  {acct} ({atype}): equity={equity} "
+              f"cashOnlyBP={bp.get('cashOnlyBuyingPower')} "
+              f"buyingPower={bp.get('buyingPower')} positions={n_pos}")
+
     pinned = (os.getenv("PUBLIC_ACCOUNT_ID") or "").strip()
     valid_ids = {str(a.get("accountId")) for a in accounts if isinstance(a, dict)}
     print(f"\nPUBLIC_ACCOUNT_ID pinned to: {pinned or '(unset)'}")
