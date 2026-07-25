@@ -32,6 +32,22 @@ ACCOUNT_URL = "https://api.public.com/userapigateway/trading/account"
 QUOTES_URL_TMPL = "https://api.public.com/userapigateway/marketdata/{accountId}/quotes"
 ORDER_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/order"
 PORTFOLIO_V2_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/portfolio/v2"
+PREFLIGHT_URL_TMPL = "https://api.public.com/userapigateway/trading/{accountId}/preflight/single-leg"
+
+
+class PreTradeBlocked(Exception):
+    """Raised when a pre-trade safety check declines a BUY order.
+
+    Deliberately an Exception subclass so the existing `except Exception`
+    handler at the BUY call site skips the symbol cleanly. That matters:
+    if a declined order returned normally instead, the caller would go on
+    to increment trade counters, write entry state, call log_trade(), and
+    upsert_open_position() — manufacturing a phantom position for an order
+    that was never placed.
+
+    Only BUYs raise this. SELLs are NEVER blocked — see
+    place_market_sell_quantity for why.
+    """
 
 NY_TZ = ZoneInfo("America/New_York")
 STATE_FILE = "state.json"
@@ -919,6 +935,215 @@ class PublicClient:
         seed = f"{account_id}:{now_min}:{side}:{symbol}"
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 
+    # ── Pre-trade safety (added 2026-07-25) ────────────────────────────────
+    #
+    # Runs Public's preflight endpoint before placing an order.
+    #
+    #   BUY  -> GATED. A definitive negative raises PreTradeBlocked.
+    #   SELL -> NEVER GATED. place_market_sell_quantity is the exit path for
+    #           the DAILY_LOSS_LIMIT kill switch, the MAX_DRAWDOWN kill
+    #           switch, dynamic stop-loss and dynamic take-profit. Blocking
+    #           it on an API hiccup could strand a losing position. We log
+    #           the preflight estimates and place the order regardless.
+    #
+    # Mirrors league_core/public_api/equities.py. Note we do NOT send a
+    # `useMargin` field: Public's changelog (2026-06-16) announced it, but
+    # as of 2026-07-25 it is absent from the documented request schema for
+    # both place-order and preflight, and from the official equity-order
+    # guide. Cash-only is enforced from the preflight RESPONSE instead,
+    # which is documented behavior.
+    #
+    # Env flags, read at call time:
+    #   EQUITIES_PREFLIGHT         default true   — run preflight at all
+    #   EQUITIES_CASH_ONLY         default true   — refuse margin-consuming BUYs
+    #   EQUITIES_PREFLIGHT_STRICT  default false  — also refuse when the
+    #                                               preflight CALL fails
+    # On Fly, set these with the STOCK_ prefix (auto-stripped per-job by
+    # agent_runner/scheduler.py) to tune this bot independently of the
+    # league_core client used by etf_rotation_v1.
+
+    @staticmethod
+    def _pre_env_flag(name: str, default: bool) -> bool:
+        raw = (os.getenv(name) or "").strip().lower()
+        if not raw:
+            return default
+        return raw in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _pre_to_float(v: Any) -> Optional[float]:
+        """Public returns numerics as JSON strings. Coerce, or None."""
+        if v is None:
+            return None
+        try:
+            return float(str(v))
+        except (TypeError, ValueError):
+            return None
+
+    def _cash_only_buying_power(self) -> Optional[float]:
+        """Read buyingPower.cashOnlyBuyingPower from portfolio v2.
+        None means 'unknown' (never treated as zero)."""
+        try:
+            portfolio = self.get_portfolio_v2()
+        except Exception as e:  # noqa: BLE001
+            print_status("PREFLIGHT_PORTFOLIO_ERROR", f"{e}")
+            return None
+        bp = (portfolio or {}).get("buyingPower") or {}
+        return self._pre_to_float(bp.get("cashOnlyBuyingPower"))
+
+    def preflight_single_leg(
+        self,
+        symbol: str,
+        side: str,
+        amount_usd: Optional[float] = None,
+        quantity: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """POST Public's preflight endpoint. NEVER raises.
+
+        Returns {"ok": bool, "status": int|None, "body": dict|None,
+                 "error": str|None}.
+        """
+        try:
+            account_id = self.get_account_id()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "status": None, "body": None,
+                    "error": f"account_id_unresolved: {e}"}
+
+        # Same body as an order, minus orderId. validateOrder defaults true.
+        payload: Dict[str, Any] = {
+            "instrument": {"symbol": symbol, "type": "EQUITY"},
+            "orderSide": side,
+            "orderType": "MARKET",
+            "expiration": {"timeInForce": "DAY"},
+        }
+        if amount_usd is not None:
+            payload["amount"] = f"{round(float(amount_usd), 2):.2f}"
+        if quantity is not None:
+            payload["quantity"] = f"{float(quantity):.8f}"
+
+        try:
+            resp = requests.post(
+                PREFLIGHT_URL_TMPL.format(accountId=account_id),
+                headers={**self.auth.auth_headers(), "Content-Type": "application/json"},
+                json=payload,
+                timeout=15,
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "status": None, "body": None,
+                    "error": f"network_error: {e}"}
+
+        if resp.status_code >= 400:
+            print_status(
+                "PREFLIGHT_REJECTED",
+                f"{side} {symbol} status={resp.status_code} body={resp.text[:300]}",
+            )
+            return {"ok": False, "status": resp.status_code, "body": None,
+                    "error": f"http_{resp.status_code}"}
+        try:
+            return {"ok": True, "status": resp.status_code,
+                    "body": resp.json(), "error": None}
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "status": resp.status_code, "body": None,
+                    "error": "non_json_response"}
+
+    def _preflight_details(self, body: Dict[str, Any],
+                           cash_bp: Optional[float]) -> Dict[str, Any]:
+        """Flatten the preflight response into loggable numbers. Pure."""
+        mi = body.get("marginImpact") or {}
+        mr = body.get("marginRequirement") or {}
+        ss = body.get("shortSelling") or {}
+        return {
+            "order_value":              self._pre_to_float(body.get("orderValue")),
+            "estimated_cost":           self._pre_to_float(body.get("estimatedCost")),
+            "estimated_proceeds":       self._pre_to_float(body.get("estimatedProceeds")),
+            "buying_power_requirement": self._pre_to_float(body.get("buyingPowerRequirement")),
+            "estimated_commission":     self._pre_to_float(body.get("estimatedCommission")),
+            "margin_usage_impact":      self._pre_to_float(mi.get("marginUsageImpact")),
+            "initial_margin_req":       self._pre_to_float(mi.get("initialMarginRequirement")),
+            "long_initial_req":         self._pre_to_float(mr.get("longInitialRequirement")),
+            "short_availability":       ss.get("availability"),
+            "cash_buying_power":        cash_bp,
+        }
+
+    def pre_trade_check_buy(self, symbol: str, amount_usd: float) -> None:
+        """Gate a BUY. Raises PreTradeBlocked on a definitive negative.
+        Returns None (allow) otherwise.
+
+        Failure semantics:
+          * preflight 4xx      -> Public evaluated and said no. ALWAYS raise.
+          * preflight call err -> couldn't check. Raise only if
+                                  EQUITIES_PREFLIGHT_STRICT. Default is to
+                                  proceed: Public still enforces buying power
+                                  at placement, and the bot's own risk envs
+                                  (MAX_ORDER_AMOUNT_USD, exposure caps, etc.)
+                                  already gated this order upstream.
+          * missing/garbage numerics -> never blocks.
+        """
+        if not self._pre_env_flag("EQUITIES_PREFLIGHT", True):
+            return
+        cash_only = self._pre_env_flag("EQUITIES_CASH_ONLY", True)
+        strict = self._pre_env_flag("EQUITIES_PREFLIGHT_STRICT", False)
+
+        pf = self.preflight_single_leg(symbol, "BUY", amount_usd=amount_usd)
+        if not pf["ok"]:
+            err = str(pf.get("error") or "")
+            if err.startswith("http_4"):
+                raise PreTradeBlocked(
+                    f"BUY {symbol} declined by preflight validation ({err})")
+            if strict:
+                raise PreTradeBlocked(
+                    f"BUY {symbol} declined — preflight unavailable ({err}) "
+                    f"and EQUITIES_PREFLIGHT_STRICT=true")
+            print_status("PREFLIGHT_UNAVAILABLE",
+                         f"BUY {symbol} ({err}); proceeding (strict=false)")
+            return
+
+        cash_bp = self._cash_only_buying_power() if cash_only else None
+        d = self._preflight_details(pf["body"] or {}, cash_bp)
+        print_status(
+            "PREFLIGHT_BUY",
+            f"{symbol} cost={d['estimated_cost']} bpr={d['buying_power_requirement']} "
+            f"margin_impact={d['margin_usage_impact']} cash_bp={d['cash_buying_power']}",
+        )
+        if not cash_only:
+            return
+
+        for key in ("margin_usage_impact", "initial_margin_req", "long_initial_req"):
+            val = d[key]
+            if val is not None and val > 0:
+                raise PreTradeBlocked(
+                    f"BUY {symbol} declined — would consume margin "
+                    f"({key}={val}); EQUITIES_CASH_ONLY=true")
+
+        bpr = d["buying_power_requirement"]
+        if bpr is not None and cash_bp is not None and bpr > cash_bp:
+            raise PreTradeBlocked(
+                f"BUY {symbol} declined — buying power requirement {bpr} "
+                f"exceeds cash-only buying power {cash_bp}")
+
+    def log_preflight_sell(self, symbol: str, quantity: float) -> None:
+        """Preflight a SELL for VISIBILITY ONLY. Never raises, never blocks.
+
+        Intentionally advisory: this same code path serves the
+        DAILY_LOSS_LIMIT and MAX_DRAWDOWN kill switches plus stop-loss and
+        take-profit exits. An exit must always be attempted.
+        """
+        if not self._pre_env_flag("EQUITIES_PREFLIGHT", True):
+            return
+        try:
+            pf = self.preflight_single_leg(symbol, "SELL", quantity=quantity)
+            if not pf["ok"]:
+                print_status("PREFLIGHT_SELL_SKIPPED",
+                             f"{symbol} ({pf.get('error')}) — placing anyway")
+                return
+            d = self._preflight_details(pf["body"] or {}, None)
+            print_status(
+                "PREFLIGHT_SELL",
+                f"{symbol} proceeds={d['estimated_proceeds']} "
+                f"commission={d['estimated_commission']} (advisory only)",
+            )
+        except Exception as e:  # noqa: BLE001 - advisory path must never break an exit
+            print_status("PREFLIGHT_SELL_ERROR", f"{symbol} {e} — placing anyway")
+
     def place_market_buy_amount(self, symbol: str, amount_usd: float) -> Dict[str, Any]:
         if amount_usd <= 0:
             raise ValueError("amount_usd must be > 0")
@@ -935,6 +1160,11 @@ class PublicClient:
         }
         if self.dry_run:
             return {"orderId": order_id, "response": {"dry_run": True, "payload": payload}}
+        # Gate the BUY. Raises PreTradeBlocked on a definitive negative,
+        # which the caller's `except Exception` skips cleanly — no phantom
+        # position, no trade row. Runs AFTER the dry_run short-circuit so
+        # dry runs stay offline.
+        self.pre_trade_check_buy(symbol, notional)
         resp = requests.post(
             ORDER_URL_TMPL.format(accountId=account_id),
             headers={**self.auth.auth_headers(), "Content-Type": "application/json"},
@@ -1045,6 +1275,10 @@ class PublicClient:
         }
         if self.dry_run:
             return {"orderId": order_id, "response": {"dry_run": True, "payload": payload}}
+        # ADVISORY ONLY — logs preflight estimates, never blocks. This path
+        # serves the DAILY_LOSS_LIMIT and MAX_DRAWDOWN kill switches plus
+        # stop-loss and take-profit exits; an exit must always be attempted.
+        self.log_preflight_sell(symbol, quantity)
         resp = requests.post(
             ORDER_URL_TMPL.format(accountId=account_id),
             headers={**self.auth.auth_headers(), "Content-Type": "application/json"},
