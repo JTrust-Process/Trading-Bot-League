@@ -141,28 +141,14 @@ def auth_headers(*, force_refresh: bool = False) -> Optional[dict[str, str]]:
 
 # ── Account ID ──────────────────────────────────────────────────────────────
 
-def get_account_id(*, force_refresh: bool = False) -> Optional[str]:
-    """Resolve and cache the brokerage accountId for trading calls. None
-    on failure.
+def _mask(v: Any) -> str:
+    s = str(v or "")
+    return s[:4] + "..." + s[-4:] if len(s) > 8 else (s or "?")
 
-    Resolution order:
-      1. PUBLIC_ACCOUNT_ID env var (preferred — explicit pin).
-      2. GET /userapigateway/trading/account, pick the first accountId.
 
-    Pinning via PUBLIC_ACCOUNT_ID is strongly recommended for production
-    so the bot can never trade on the wrong account if Public ever returns
-    accounts in a different order.
-    """
-    if not force_refresh and _account_cache.get("account_id"):
-        return str(_account_cache["account_id"])
-
-    # 1. Env-pinned wins.
-    pinned = (os.getenv("PUBLIC_ACCOUNT_ID") or "").strip()
-    if pinned:
-        _account_cache["account_id"] = pinned
-        return pinned
-
-    # 2. Fall back to the API. Less safe — we'd rather fail than guess wrong.
+def fetch_accounts() -> Optional[list[dict[str, Any]]]:
+    """GET the account list. None on any failure (network, non-200, bad
+    shape). Distinguishable from [] which would mean 'no accounts'."""
     if requests is None:
         return None
     headers = auth_headers()
@@ -182,11 +168,91 @@ def get_account_id(*, force_refresh: bool = False) -> Optional[str]:
         _print(f"account list returned non-JSON {_redacted(resp)}")
         return None
     accounts = data.get("accounts") if isinstance(data, dict) else None
-    if not isinstance(accounts, list) or not accounts:
-        _print(f"account list empty / unexpected shape (keys={list((data or {}).keys())})")
+    if not isinstance(accounts, list):
+        _print(f"account list unexpected shape (keys={list((data or {}).keys())})")
         return None
-    first = accounts[0]
-    acc_id = first.get("accountId") if isinstance(first, dict) else None
+    return [a for a in accounts if isinstance(a, dict)]
+
+
+def get_account_id(*, force_refresh: bool = False) -> Optional[str]:
+    """Resolve and cache the brokerage accountId for trading calls. None
+    on failure.
+
+    Resolution order:
+      1. PUBLIC_ACCOUNT_ID env var (preferred — explicit pin), VALIDATED
+         against the account list.
+      2. GET /userapigateway/trading/account, pick the first accountId.
+
+    VALIDATION (added 2026-07-25). This function previously trusted
+    PUBLIC_ACCOUNT_ID blindly. A stale/incorrect pin therefore produced
+    `{"code":47050,"message":"Account not found"}` on every order and a
+    404 on portfolio v2 — and because etf_rotation_v1 (the only consumer
+    of this client) has been live-but-dormant since June, the fault was
+    invisible. Its first real rebalance would have failed outright.
+
+    Now:
+      * pinned AND present in the account list -> use it.
+      * pinned AND NOT in the list             -> refuse (return None) and
+                                                  log the valid ids. Trading
+                                                  on the wrong account is
+                                                  worse than not trading.
+      * pinned but the list can't be fetched   -> trust the pin, warn. A
+                                                  network blip shouldn't
+                                                  halt trading, and Public
+                                                  will reject a bad id
+                                                  anyway.
+      * not pinned                             -> accounts[0], warn when
+                                                  there's more than one.
+
+    Set PUBLIC_ACCOUNT_ID_SKIP_VALIDATION=1 to restore the old
+    trust-blindly behavior (escape hatch; not recommended).
+    """
+    if not force_refresh and _account_cache.get("account_id"):
+        return str(_account_cache["account_id"])
+
+    pinned = (os.getenv("PUBLIC_ACCOUNT_ID") or "").strip()
+    skip_validation = (
+        (os.getenv("PUBLIC_ACCOUNT_ID_SKIP_VALIDATION") or "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+    if pinned and skip_validation:
+        _print(f"account id {_mask(pinned)} pinned; validation SKIPPED "
+               f"(PUBLIC_ACCOUNT_ID_SKIP_VALIDATION set)")
+        _account_cache["account_id"] = pinned
+        return pinned
+
+    accounts = fetch_accounts()
+
+    if pinned:
+        if accounts is None:
+            # Couldn't verify. Don't halt trading over a transient failure.
+            _print(f"account list unavailable; trusting pinned id {_mask(pinned)}")
+            _account_cache["account_id"] = pinned
+            return pinned
+        valid = {str(a.get("accountId")) for a in accounts if a.get("accountId")}
+        if pinned in valid:
+            _account_cache["account_id"] = pinned
+            return pinned
+        _print(
+            f"REFUSING: PUBLIC_ACCOUNT_ID={_mask(pinned)} is not in this "
+            f"key's account list. Valid ids: "
+            f"{sorted(_mask(v) for v in valid) or '(none)'}. "
+            f"Fix the secret — orders would fail with 'Account not found'."
+        )
+        return None
+
+    # Not pinned — fall back to the first account.
+    if not accounts:
+        _print("no accounts available and PUBLIC_ACCOUNT_ID not set")
+        return None
+    if len(accounts) > 1:
+        _print(
+            f"WARNING: {len(accounts)} accounts returned and PUBLIC_ACCOUNT_ID "
+            f"is not set; defaulting to the first. Pin it explicitly to avoid "
+            f"trading on the wrong account."
+        )
+    acc_id = accounts[0].get("accountId")
     if not acc_id:
         _print("first account has no accountId field")
         return None
@@ -207,6 +273,7 @@ __all__ = [
     "ACCOUNT_URL",
     "get_access_token",
     "auth_headers",
+    "fetch_accounts",
     "get_account_id",
     "reset_caches",
 ]

@@ -110,22 +110,90 @@ def _probe(account_id: str, headers: dict, symbol: str, inst_type: str,
         print(f"VERDICT: inconclusive (status {resp.status_code}).")
 
 
+ACCOUNT_URL = "https://api.public.com/userapigateway/trading/account"
+
+
+def _mask(v: str) -> str:
+    v = str(v or "")
+    return v[:4] + "..." + v[-4:] if len(v) > 8 else (v or "?")
+
+
+def _list_accounts(headers: dict) -> None:
+    """Show what account IDs Public actually reports for this key, and
+    compare against whatever PUBLIC_ACCOUNT_ID is pinned to.
+
+    Added 2026-07-25 after both preflight probes returned
+    {"code":47050,"message":"Account not found"} and portfolio v2 404'd —
+    symptoms of a wrong/stale pinned account id rather than an
+    unsupported instrument type.
+    """
+    print("\n--- accounts reported by Public ---")
+    try:
+        resp = requests.get(ACCOUNT_URL, headers=headers, timeout=20)
+    except Exception as e:  # noqa: BLE001
+        print(f"accounts request failed: {e!r}")
+        return
+    print(f"status: {resp.status_code}")
+    if resp.status_code != 200:
+        print(f"body: {resp.text[:600]}")
+        return
+    try:
+        data = resp.json()
+    except ValueError:
+        print(f"non-JSON body: {resp.text[:400]}")
+        return
+
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(accounts, list) or not accounts:
+        print(f"unexpected shape, keys={list((data or {}).keys())}")
+        print(f"raw: {json.dumps(data)[:600]}")
+        return
+
+    print(f"{len(accounts)} account(s):")
+    for a in accounts:
+        if not isinstance(a, dict):
+            continue
+        print(f"  accountId={_mask(a.get('accountId'))}  "
+              f"full={a.get('accountId')}  "
+              f"type={a.get('accountType')}  "
+              f"number={a.get('accountNumber')}  "
+              f"status={a.get('status')}")
+
+    pinned = (os.getenv("PUBLIC_ACCOUNT_ID") or "").strip()
+    valid_ids = {str(a.get("accountId")) for a in accounts if isinstance(a, dict)}
+    print(f"\nPUBLIC_ACCOUNT_ID pinned to: {pinned or '(unset)'}")
+    if not pinned:
+        print("VERDICT: unset — league_core.auth would fall back to accounts[0].")
+    elif pinned in valid_ids:
+        print("VERDICT: pinned id IS valid. The 400/404 came from something else.")
+    else:
+        print("VERDICT: *** PINNED ID IS NOT IN THE ACCOUNT LIST ***")
+        print("         This is why preflight returns 'Account not found' and")
+        print("         portfolio v2 404s. etf_rotation_v1 uses this resolver")
+        print("         and is in mode='live' — its next real order would fail.")
+        print("         Fix: fly secrets set PUBLIC_ACCOUNT_ID='<one of the ids above>'")
+
+
 def main() -> int:
     if not os.getenv("PUBLIC_SECRET"):
         print("PUBLIC_SECRET not set — cannot probe.")
         return 1
 
-    account_id = auth.get_account_id()
-    if not account_id:
-        print("Could not resolve account id. Set PUBLIC_ACCOUNT_ID.")
-        return 1
     headers = auth.auth_headers()
     if headers is None:
         print("Could not obtain access token — check PUBLIC_SECRET.")
         return 1
 
-    masked = account_id[:4] + "..." + account_id[-4:] if len(account_id) > 8 else "?"
-    print(f"account: {masked}")
+    # Diagnose account resolution FIRST — a bad account id makes every
+    # downstream probe meaningless.
+    _list_accounts(headers)
+
+    account_id = auth.get_account_id()
+    if not account_id:
+        print("Could not resolve account id. Set PUBLIC_ACCOUNT_ID.")
+        return 1
+
+    print(f"\nresolver returned: {_mask(account_id)}")
     print("NOTE: preflight places NO orders. This is read-only.")
 
     # 1. Control — equity.

@@ -105,9 +105,18 @@ def main() -> int:
     # auth.get_account_id is called inside place_market_buy even in dry-run.
     # In a fresh test environment PUBLIC_ACCOUNT_ID may not be set; we set
     # a dummy one to keep the dry-run path self-contained.
+    #
+    # PUBLIC_ACCOUNT_ID_SKIP_VALIDATION keeps this test HERMETIC. As of
+    # 2026-07-25 get_account_id validates a pinned id against Public's
+    # account list (see auth.py) — without the skip flag this test would
+    # attempt a network call whenever PUBLIC_SECRET happens to be present
+    # in the environment. Setting it here also exercises the escape hatch.
     os.environ["PUBLIC_ACCOUNT_ID"] = "test-account-id"
+    os.environ["PUBLIC_ACCOUNT_ID_SKIP_VALIDATION"] = "1"
     from league_core.public_api import auth
     auth.reset_caches()
+    fails += _check("skip-validation returns the pinned id",
+                    "test-account-id", auth.get_account_id())
 
     res = equities.place_market_buy("SPY", 250.0, dry_run=True)
     fails += _check("BUY dry_run ok=True",         True,   res["ok"])
