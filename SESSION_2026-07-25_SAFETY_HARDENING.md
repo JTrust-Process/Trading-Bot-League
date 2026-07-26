@@ -237,6 +237,128 @@ When the next regime change does fire, expect log lines like:
 
 if anything trips, and normal order placement otherwise.
 
+---
+
+# Part 2 — what the safety work uncovered
+
+The preflight work was the stated goal. Probing the API to build it
+surfaced a chain of latent defects that mattered more. **None of these
+threw errors.** Every one was a system confidently reporting something
+untrue, which is why they survived months of the bots "working fine".
+
+## Live-capital misconfiguration (caught ~36h before it bit)
+
+`PUBLIC_ACCOUNT_ID` on Fly was set to `<5OG08899>` — **with literal angle
+brackets**, pasted from a `'<your-account-id>'` placeholder.
+
+| Bot | Resolver | Exposure |
+|---|---|---|
+| `etf_rotation_v1` | `league_core.auth`, honored the pin | Next rebalance would have failed `Account not found` |
+| `stock_momentum_v1` | own resolver, validates | Would have failed first Fly cycle Mon 14:17 UTC |
+| `crypto_ema_atr_v1` | `get_primary_account_id()` — **ignored the pin**, took `accounts[0]` | Silently traded the WRONG account |
+
+Crypto's resolver taking `accounts[0]` is the subtler bug: Public does not
+guarantee account ordering, jerry has 7 accounts, and the ordering shifted
+at some point — moving the bot off 5OG08899 (where its crypto actually
+sits) without a word.
+
+Fixed: both resolvers now validate the pin against the live account list
+and **refuse** on mismatch rather than falling back to a guess. Escape
+hatch `PUBLIC_ACCOUNT_ID_SKIP_VALIDATION=1`.
+
+Verified settled: last crypto trade was 2026-05-14, so nothing ever
+executed on the wrong account.
+
+## `useMargin` does not exist
+
+Public's changelog (2026-06-16) announces an optional `useMargin` order
+field. It appears in **no** documented request schema, nor the official
+equity-order guide. We do not send it — putting an unverified field into
+a live-capital payload to achieve a *safety* goal is backwards.
+
+Cash-only is enforced from the preflight **response** instead. Probed
+live and documented in `equities.py`: CRYPTO **is** supported by preflight
+despite the docs describing it in equity/options terms, and
+`marginImpact`/`marginRequirement` return **null** on a cash account — so
+the margin branch can never fire there and the working guard is
+`buyingPowerRequirement > cashOnlyBuyingPower`. The margin checks are kept
+because they cost nothing and activate if margin is ever enabled; they are
+not today's protection.
+
+## GHA-injected env vars are a migration hazard
+
+`crypto_bot/state/remote.py::_key()` read `GITHUB_REF_NAME` — auto-set by
+GitHub Actions to the branch name, `"main"` — to key its Supabase
+`bot_state` row. On Fly that variable does not exist, so it fell through
+to `"default"` and the bot began writing a **brand new state row**: price
+history reset, position tracking reset, the accumulated `main` row
+orphaned. Nothing errored. The only symptom was a dashboard panel
+reporting "warming up regime filter (42/55 prices)" for a bot running
+since March.
+
+Fixed via `CRYPTO_STATE_KEY=main` in fly.toml, plus the resolved key and
+its source are now logged once per process.
+
+Same family: `GITHUB_SHA` left `bot_runs.git_sha` null since the
+migration, destroying deploy traceability. Now falls back to the Fly
+deployment tag. **When migrating anything else off GHA, grep for
+`GITHUB_` first.**
+
+## Surfaces reporting things that weren't true
+
+| Surface | Was showing | Fix |
+|---|---|---|
+| League dashboard health | Daily bots permanently "Degraded" — flat 30/120-min thresholds applied to every bot regardless of cadence | Thresholds now scale to each bot's **observed median run interval** (2.5 missed cycles → degraded, 5 → stale), derived from `bot_runs` so schedule changes need no UI edit |
+| Crypto dashboard | Full live-looking ETH panel for a symbol not traded since April | `NEXT_PUBLIC_SYMBOLS` made authoritative instead of a last-resort fallback it could never reach |
+| `bot_expenses` Claude Pro row | "interactive AI trading via Claude Desktop MCP server" — a server that was never built | Re-attributed to actual usage |
+| `bot_expenses` Anthropic row | "~$0.003/run" asserted as fact, never measured, and ~2× low while the bot double-billed on GHA+Fly | Marked as an unmeasured estimate; real token counts now recorded per run |
+
+## Divergent asset classification (data corruption, quiet)
+
+Three bots each had their own `_classify` ETF allowlist:
+`short_watchlist` knew `{QQQ, SPY, IWM, XLK}`, `options_alert` knew
+`{SPY, QQQ, IWM}`, `stock_momentum` knew 30+. So **XLK was written to
+`bot_trades.asset_class` as `etf` by one bot and `equity` by another** —
+any query grouping by asset class was wrong depending on which bot wrote
+the row.
+
+Consolidated into `league_core/common.py` alongside `env_float` /
+`env_bool` / `env_int` / `env_list` / `closes` / `sma` / `rolling_low` /
+`rolling_high` / `pct_return` — all previously duplicated 2-3× each,
+`env_bool` under three different names (`_env_bool`, `_env_flag`,
+`_pre_env_flag`).
+
+Also fixed in passing: `REGIME_SMA_PERIOD` used `int(os.getenv(...))`,
+which throws on `"200.0"` and silently fell back to the default.
+`env_int` tolerates float-ish strings.
+
+Vendored bots keep their local helpers deliberately (bigger blast radius,
+own conventions). The one exception is `stock_momentum_v1`'s classifier,
+since it writes to the shared table — it delegates to `common` with a
+fallback so it still works standalone.
+
+Historical rows keep whatever the writing bot decided. Backfill SQL is in
+the chat log if you want them consistent.
+
+## New test suites
+
+```powershell
+python -m league_core._common_smoke      # env parsing, classification, series maths
+python -m league_core._equities_smoke    # order payloads + preflight rules engine
+python -m league_core._risk_smoke        # risk gate
+```
+
+All offline. `_equities_smoke` sets
+`PUBLIC_ACCOUNT_ID_SKIP_VALIDATION=1` to stay hermetic now that
+`get_account_id` validates over the network.
+
+## Diagnostic tooling added
+
+`scripts/probe_preflight_crypto.py` — read-only, places no orders. Lists
+every account with balances, validates the pinned `PUBLIC_ACCOUNT_ID`
+against them, and probes preflight for both EQUITY and CRYPTO. This is
+what caught the bracket typo.
+
 ## Still open
 
 - Stock bot BUY-only preflight gate (task #3, constraint documented)
