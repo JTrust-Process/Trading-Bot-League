@@ -44,6 +44,33 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, EVENT_JOB_EXECUTED
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  ⚠ DAY-OF-WEEK: always use NAMES (mon-fri), never numbers
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `CronTrigger.from_crontab()` parses a standard 5-field crontab string but
+# hands the day-of-week field straight to APScheduler's own DayOfWeekField,
+# which numbers days DIFFERENTLY:
+#
+#            0     1     2     3     4     5     6
+#   cron    sun   mon   tue   wed   thu   fri   sat
+#   APS     mon   tue   wed   thu   fri   sat   sun
+#
+# So "1-5" means Mon-Fri in crontab and TUE-SAT in APScheduler. There is no
+# conversion and no warning.
+#
+# This bit us in production: the bots carried "1-5" over from their GitHub
+# Actions workflows during the 2026-07-24 migration to Fly. On GHA that was
+# Mon-Fri; on APScheduler it silently became Tue-Sat. For ten days the
+# weekday bots skipped every Monday — a full trading day, every week — and
+# ran on Saturdays with the market shut. Nothing errored. It surfaced only
+# on 2026-08-03, a Monday, when the logs showed the 24/7 jobs running and
+# the weekday jobs absent.
+#
+# Weekday names are unambiguous across both systems. Use them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # ── Logging setup ──────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -237,7 +264,7 @@ def build_scheduler() -> BlockingScheduler:
     # ── Daily research bots — weekday only, single fire per day ─────────────
     sched.add_job(
         _run_bot, args=("bond_research_v1", "bots.bond_research_v1.main"),
-        trigger=CronTrigger.from_crontab("35 14 * * 1-5", timezone="UTC"),
+        trigger=CronTrigger.from_crontab("35 14 * * mon-fri", timezone="UTC"),
         id="bond_research_v1", name="bond_research_v1 (daily)",
     )
     # ── options_alert_v1 — DISABLED 2026-07-24 ─────────────────────────────
@@ -252,24 +279,24 @@ def build_scheduler() -> BlockingScheduler:
     # this add_job block from git history to re-activate.
     # sched.add_job(
     #     _run_bot, args=("options_alert_v1", "bots.options_alert_v1.main"),
-    #     trigger=CronTrigger.from_crontab("43 14 * * 1-5", timezone="UTC"),
+    #     trigger=CronTrigger.from_crontab("43 14 * * mon-fri", timezone="UTC"),
     #     id="options_alert_v1", name="options_alert_v1 (daily)",
     # )
     sched.add_job(
         _run_bot, args=("agent_research_v1", "bots.agent_research_v1.main"),
-        trigger=CronTrigger.from_crontab("50 14 * * 1-5", timezone="UTC"),
+        trigger=CronTrigger.from_crontab("50 14 * * mon-fri", timezone="UTC"),
         id="agent_research_v1", name="agent_research_v1 (daily)",
     )
 
     # ── Hourly paper bots — weekday market hours ────────────────────────────
     sched.add_job(
         _run_bot, args=("etf_rotation_v1", "bots.etf_rotation_v1.main"),
-        trigger=CronTrigger.from_crontab("33 14-20 * * 1-5", timezone="UTC"),
+        trigger=CronTrigger.from_crontab("33 14-20 * * mon-fri", timezone="UTC"),
         id="etf_rotation_v1", name="etf_rotation_v1 (hourly mkt hrs)",
     )
     sched.add_job(
         _run_bot, args=("short_watchlist_v1", "bots.short_watchlist_v1.main"),
-        trigger=CronTrigger.from_crontab("41 14-20 * * 1-5", timezone="UTC"),
+        trigger=CronTrigger.from_crontab("41 14-20 * * mon-fri", timezone="UTC"),
         id="short_watchlist_v1", name="short_watchlist_v1 (hourly mkt hrs)",
     )
 
@@ -296,7 +323,7 @@ def build_scheduler() -> BlockingScheduler:
     if os.getenv("LIVE_BOTS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
         sched.add_job(
             _run_bot, args=("stock_momentum_v1", "bots.stock_momentum_v1.main"),
-            trigger=CronTrigger.from_crontab("17 14-20 * * 1-5", timezone="UTC"),
+            trigger=CronTrigger.from_crontab("17 14-20 * * mon-fri", timezone="UTC"),
             id="stock_momentum_v1",
             name="stock_momentum_v1 (weekday :17 mkt hrs)",
         )
