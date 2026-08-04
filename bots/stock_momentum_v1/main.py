@@ -26,12 +26,13 @@ History / future work:
 from __future__ import annotations
 
 import os
+import runpy
 import sys
 import traceback
 
 # Make this directory importable so the vendored bot code, which uses
 # flat-layout imports like `from monitor import Monitor`, can find its
-# siblings. MUST run before `import bot` below.
+# siblings. MUST run before running `bot` below.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -49,29 +50,34 @@ def run_cycle() -> int:
     where `python bot.py` is expected to exit 0 even on internal
     warnings, with state recorded in Supabase rather than the exit code.
     """
-    # Lazy import: `bot` pulls in pandas, the Supabase client, the Public
-    # API client, etc. — heavy. Importing only when run_cycle is actually
-    # called keeps `python -m bots.stock_momentum_v1` lightweight for
-    # health checks and dry imports.
+    # Run bot.py AS A SCRIPT, not as an import.
+    #
+    # CRITICAL (fixed 2026-08-03). This previously did `import bot;
+    # bot.main()`. But bot.py's cleanup — monitor.end_run(),
+    # league_status.end_run(), notify_run_end() — lives inside its
+    # `if __name__ == "__main__":` block, NOT inside main(). Importing the
+    # module sets __name__ to "bot", so that entire try/finally never ran.
+    #
+    # start_run() IS inside main(), so every cycle opened a bot_runs row and
+    # never closed it. From the 2026-07-24 migration until this fix, every
+    # stock cycle left an orphaned status='running' row in BOTH Supabase
+    # projects, sent no "Bot Cycle Complete" Discord notice, and wrote no
+    # final heartbeat carrying the run outcome. Nothing errored — the job
+    # logged "✓ job done" every time.
+    #
+    # runpy with run_name="__main__" executes the guard, which is exactly
+    # what GitHub Actions did with `python bot.py`. Same approach already
+    # used by bots/crypto_ema_atr_v1/main.py.
     try:
-        import bot  # noqa: WPS433 - intentional inside-function import
-    except Exception as e:  # noqa: BLE001
-        print(f"[stock_momentum_v1] import bot failed: {e!r}")
-        traceback.print_exc()
-        return 1
-
-    try:
-        bot.main()
+        runpy.run_module("bot", run_name="__main__")
         return 0
     except SystemExit as e:
-        # bot.main() may call sys.exit() in its own finally — treat any
-        # exit-zero as success, anything else as failure.
+        # bot.py re-raises after its finally; exit 0 is a clean run.
         code = e.code if isinstance(e.code, int) else 0
         return 0 if code == 0 else 1
     except Exception as e:  # noqa: BLE001
-        # The bot's own try/finally inside main() handles state cleanup
-        # (Monitor.end_run, league_status.end_run). We just surface the
-        # failure to APScheduler so it shows up in fly logs.
+        # bot.py's own finally has already closed out both run rows by the
+        # time an exception reaches here. Surface it for the Fly logs.
         print(f"[stock_momentum_v1] cycle crashed: {e!r}")
         traceback.print_exc()
         return 1
