@@ -322,6 +322,95 @@ def _live_close_position(
     return (pnl_usd, pnl_pct)
 
 
+# ── Mark-to-market (added 2026-08-08) ──────────────────────────────────────
+
+
+def _mark_positions_to_market(run_id: Optional[str]) -> None:
+    """Refresh unrealized PnL on every open position.
+
+    WHY: this bot opens a basket on a regime change and then holds it,
+    potentially for months. Until now nothing updated those rows between
+    open and close, so `bot_positions.pnl_usd` stayed NULL for the entire
+    holding period — 79 days and counting on the basket opened 2026-05-21.
+    The dashboard consequently rendered notional at ENTRY price and
+    presented it as current exposure, and there was no way to answer "is
+    this basket up or down" without pricing it by hand.
+
+    Same failure shape as everything else found this month: a surface
+    stating something with confidence that nothing had actually computed.
+
+    Fail-soft throughout. A pricing failure on one symbol must never
+    interfere with the rebalance decision, so every branch swallows and
+    continues — this is reporting, not trading logic.
+
+    Written into metadata rather than the pnl_usd/pnl_pct columns on
+    purpose: those columns mean REALIZED pnl everywhere else in the
+    schema, and overloading them with unrealized marks would make
+    `sum(pnl_usd)` silently wrong across every existing query.
+    """
+    cfg = league._config()  # noqa: SLF001 - intentional reuse
+    if cfg is None:
+        return
+
+    open_symbols = league.get_open_symbols(asset_class="etf")
+    if not open_symbols:
+        return
+
+    marked = 0
+    total_pnl = 0.0
+    for sym in open_symbols:
+        try:
+            pos = league._get_open_position(cfg, sym)  # noqa: SLF001
+            if not pos:
+                continue
+            qty = float(pos.get("quantity") or 0)
+            entry = float(pos.get("entry_price") or 0)
+            if qty <= 0 or entry <= 0:
+                continue
+
+            price = _fetch_close(sym)
+            if price is None or price <= 0:
+                continue
+
+            pnl_usd = (price - entry) * qty
+            pnl_pct = (price / entry) - 1.0
+            total_pnl += pnl_usd
+
+            league.upsert_position(
+                symbol=sym,
+                asset_class="etf",
+                status="open",
+                quantity=qty,
+                entry_price=entry,
+                amount_usd=float(pos.get("amount_usd") or (entry * qty)),
+                is_paper=bool(pos.get("is_paper", True)),
+                metadata={
+                    "mark_price":   price,
+                    "mark_pnl_usd": round(pnl_usd, 4),
+                    "mark_pnl_pct": round(pnl_pct, 6),
+                    "marked_at":    _utcnow_iso(),
+                },
+            )
+            marked += 1
+            print(f"[etf] mark {sym}: {entry:.2f} -> {price:.2f} "
+                  f"({pnl_pct*100:+.2f}%, ${pnl_usd:+.2f})")
+        except Exception as e:  # noqa: BLE001 - reporting must never break trading
+            print(f"[etf] mark {sym} failed: {e!r}")
+
+    if marked:
+        print(f"[etf] basket unrealized: ${total_pnl:+.2f} across {marked} position(s)")
+        league.log_event(
+            "POSITIONS_MARKED",
+            message=f"Marked {marked} position(s); unrealized ${total_pnl:+.2f}.",
+            metadata={
+                "marked":           marked,
+                "symbols":          open_symbols,
+                "unrealized_total": round(total_pnl, 4),
+            },
+            run_id=run_id,
+        )
+
+
 # ── Core ────────────────────────────────────────────────────────────────────
 
 
@@ -379,6 +468,10 @@ def run_cycle() -> str:
             # We don't trade when we can't classify the market.
             print("[etf] regime=unknown; no rebalance")
             return "warning" if final_status != "failed" else final_status
+
+        # Mark open positions to market before deciding whether to rebalance.
+        # Runs on EVERY cycle, including the no-op ones — which is the point.
+        _mark_positions_to_market(run_id)
 
         if target_set == s["last_target_set"]:
             print("[etf] target unchanged; no rebalance")

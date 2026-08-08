@@ -17,6 +17,34 @@ def log_trade(
     order_id: str | None = None,  # Public's order_id for reconciliation
 ) -> None:
     """Insert a trade record into crypto_trades. Never raises."""
+    # Guard against corrupt writes (added 2026-08-08).
+    #
+    # A row exists in crypto_trades dated 2026-04-15 with BOTH a negative
+    # price (-2339.84) and a negative size (-0.00427380) on an ETH entry.
+    # A negative price is not a thing; a negative size on a BUY is not a
+    # thing. Something upstream — most likely a signed quantity from a
+    # partially-parsed API response — produced it, and it was written
+    # without complaint because this function coerces to float and inserts.
+    #
+    # That row then silently corrupted every aggregate computed over this
+    # table: sum(pnl), trade counts, average size. It was found only by
+    # reading the raw history line by line.
+    #
+    # We refuse the write rather than sanitising it. A trade we cannot
+    # describe correctly is worse than a trade we did not log — the missing
+    # row is visible in reconciliation against the broker, whereas a
+    # plausible-looking wrong row is not.
+    if price is None or float(price) <= 0:
+        print(f"[supabase_logger] REFUSING trade write: {symbol} {side} has "
+              f"non-positive price {price!r}. Not logged. Reconcile against "
+              f"Public if this trade actually executed.")
+        return
+    if size is None or float(size) <= 0:
+        print(f"[supabase_logger] REFUSING trade write: {symbol} {side} has "
+              f"non-positive size {size!r}. Not logged. Reconcile against "
+              f"Public if this trade actually executed.")
+        return
+
     data = {
         "run_id":    run_id,
         "timestamp": now_iso(),
