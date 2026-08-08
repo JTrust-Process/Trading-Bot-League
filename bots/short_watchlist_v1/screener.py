@@ -184,7 +184,40 @@ def detect_exit(
     last = closes[-1]
     sma20 = _sma(closes, TREND_SMA_PERIOD)
 
-    # Rule A — trend reversal (close > SMA20)
+    # ── RISK EXITS FIRST ───────────────────────────────────────────────────
+    #
+    # REORDERED 2026-08-08. The adverse-move stop used to be checked AFTER
+    # the trend-reversal rule, which had two consequences:
+    #
+    #   1. A position blown far past the stop exited labelled
+    #      "trend_reversal", so the trade log understated how often risk
+    #      limits were actually breached.
+    #   2. More seriously, while price ran away from a short, `close > SMA20`
+    #      can stay FALSE (a fast rally drags the SMA up with it), so neither
+    #      rule fired and the loss just kept running.
+    #
+    # Measured cost: AMZN shorted at 232.11 on 2026-07-24, exited at 270.44
+    # on 2026-07-31 — **-16.51% against a 5% stop, a 3.3x overshoot**. It was
+    # logged as `trend_reversal`. That single trade is more than half of this
+    # strategy's -$30.29 lifetime loss.
+    #
+    # Risk limits are not signals. They get evaluated first, always.
+    if entry_price > 0:
+        move_pct = (last - entry_price) / entry_price
+
+        # Rule A — adverse move (price went UP — bad for a short)
+        if move_pct >= ADVERSE_PCT:
+            return ExitSignal(
+                symbol=symbol,
+                close=last,
+                sma20=sma20,
+                reason="stop",
+                rationale=f"adverse move {move_pct*100:+.2f}% from entry {entry_price:.2f}",
+            )
+
+    # ── SIGNAL EXITS ───────────────────────────────────────────────────────
+
+    # Rule B — trend reversal (close > SMA20)
     if sma20 is not None and last > sma20:
         return ExitSignal(
             symbol=symbol,
@@ -198,16 +231,6 @@ def detect_exit(
         return None
 
     move_pct = (last - entry_price) / entry_price
-
-    # Rule B — adverse move (price went UP — bad for a short)
-    if move_pct >= ADVERSE_PCT:
-        return ExitSignal(
-            symbol=symbol,
-            close=last,
-            sma20=sma20,
-            reason="stop",
-            rationale=f"adverse move {move_pct*100:+.2f}% from entry {entry_price:.2f}",
-        )
 
     # Rule C — favorable move (price fell ≥ FAVORABLE_PCT — good for a short)
     if move_pct <= -FAVORABLE_PCT:

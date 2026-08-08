@@ -1829,23 +1829,66 @@ def run_live_cycle(
             # accurate to the order of (1 + pnl_pct). Used for notifications only.
             pnl_usd = pnl_pct * float(pos_value or 0)
 
-        # Minimum hold period — prevents PDT violations (default 1 = no same-day sells)
+        # ── Minimum hold period ────────────────────────────────────────────
+        #
+        # FIXED 2026-08-08. This used to `continue`, skipping EVERY exit path
+        # — momentum exit, take-profit, stop-loss, daily-loss kill switch and
+        # max-drawdown kill switch — for the first `min_hold_days` days of a
+        # position. With MIN_HOLD_DAYS=2 that meant the stop loss was
+        # DISABLED for two days after every entry.
+        #
+        # The damage is visible in the trade history: realized losses averaged
+        # -3.4% against a configured 2.5% stop, and three separate positions
+        # exited at EXACTLY 2 days held (MSFT 06-09→06-11 -3.33%, META
+        # 07-20→07-22 -2.92%, NVDA 07-22→07-24 -3.32%) — the stop had been
+        # breached during the blackout and fired the moment it was allowed.
+        # Worst case was TSLA at -6.02%, 2.4x the configured stop.
+        #
+        # Expectancy math on 18 closed trades (38.9% win rate, +4.0% avg win):
+        #     realized  -3.4% avg loss -> -0.52% per trade
+        #     enforced  -2.5% avg loss -> +0.03% per trade
+        # The blackout is the difference between marginally positive and
+        # reliably negative. The entry signal was never the problem.
+        #
+        # WHY THE HOLD EXISTS AT ALL: the original comment cites PDT. But PDT
+        # (4+ day trades in 5 business days) applies to MARGIN accounts, and
+        # portfolio v2 reports cashOnlyBuyingPower == buyingPower for this
+        # account — it is a CASH account, where PDT does not apply. The real
+        # cash-account constraint is settlement: proceeds are unsettled for
+        # T+1, so RE-BUYING too quickly risks a good-faith violation. That is
+        # a constraint on buying, not on selling.
+        #
+        # So: the hold now gates only the DISCRETIONARY exit (momentum fade).
+        # Risk exits — stop loss, daily-loss limit, max drawdown — always run.
+        # Mirrors the rule already in league_core/risk.py, where CLOSE actions
+        # bypass the daily-trade cap so an emergency exit can never be blocked.
+        min_hold_active = False
         if entry_date_str and min_hold_days > 0:
             try:
                 entry_dt = datetime.strptime(entry_date_str, "%Y-%m-%d").date()
                 days_held = (today_date_et() - entry_dt).days
                 if days_held < min_hold_days:
-                    append_log(log_file, "SKIP", symbol=sym,
-                        details=f"MIN_HOLD: held {days_held}d < {min_hold_days}d required (entry={entry_date_str})")
-                    print_status("SKIP", f"{sym} MIN_HOLD {days_held}d < {min_hold_days}d")
-                    continue
+                    min_hold_active = True
+                    append_log(log_file, "MIN_HOLD_DISCRETIONARY_ONLY", symbol=sym,
+                        details=f"held {days_held}d < {min_hold_days}d — momentum exit "
+                                f"suppressed; stop-loss and kill switches STILL ACTIVE "
+                                f"(entry={entry_date_str})")
+                    print_status("MIN_HOLD", f"{sym} {days_held}d < {min_hold_days}d "
+                                             f"— discretionary exits only")
             except Exception:
                 pass
 
         # Momentum exit: sell if rank faded or score went negative (only for momentum symbols)
         # Don't momentum_exit at a loss — let stop loss handle it to avoid fee drag
+        #
+        # This is the DISCRETIONARY exit — the only one gated by min_hold. It
+        # fires on a signal fading, not on risk, so deferring it a day or two
+        # is acceptable. Stop-loss and the kill switches below are not gated.
         FEE_BUFFER = 0.005  # 0.5% minimum gain to cover fees before momentum exit
-        if sym in momentum_symbols and should_sell_momentum(sym, momentum_scores, momentum_sell_rank) and (pnl_pct is None or pnl_pct >= FEE_BUFFER):
+        if (not min_hold_active
+                and sym in momentum_symbols
+                and should_sell_momentum(sym, momentum_scores, momentum_sell_rank)
+                and (pnl_pct is None or pnl_pct >= FEE_BUFFER)):
             try:
                 result = client.place_market_sell_quantity(sym, qty)
             except Exception as sell_err:
