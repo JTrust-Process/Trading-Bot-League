@@ -19,6 +19,7 @@ from crypto_bot.state.state import (
     is_circuit_broken, get_consecutive_losses,
     should_notify_circuit_broken, mark_circuit_notified,
     candles_since_exit,
+    candle_index,
     mark_position_desync, is_position_desynced, clear_position_desync,
     should_notify_atr_fallback, mark_atr_fallback_notified,
 )
@@ -159,7 +160,26 @@ def run(monitor: Monitor, run_id: str | None) -> None:
         try:
             in_position = symbol in trader.positions
 
-            if is_circuit_broken(state, symbol, cb_thresh):
+            # Circuit breaker — blocks NEW ENTRIES only.
+            #
+            # FIXED 2026-08-08. This used to `continue` unconditionally,
+            # before the price fetch and before check_exit — despite the
+            # comment 40 lines below claiming "Hard exits — ALWAYS fire".
+            #
+            # If the breaker tripped while a position was OPEN, that position
+            # lost its stop-loss and take-profit entirely. And the deadlock
+            # was permanent: consecutive_losses is only cleared by
+            # record_win, which is only reachable from a completed SELL —
+            # which the breaker had just made unreachable.
+            #
+            # Reachable by lowering CIRCUIT_BREAKER_LOSSES while a position
+            # is open, by a partial-fill sell leaving a residual, or by a
+            # sell() that raises after the exchange filled it.
+            #
+            # `and not in_position` confines it to the entry path; the BUY
+            # branch is already guarded by `not in_position`, so an open
+            # position now falls through to check_exit as intended.
+            if is_circuit_broken(state, symbol, cb_thresh) and not in_position:
                 consecutive = get_consecutive_losses(state, symbol)
                 log_warn(
                     f"{symbol} | CIRCUIT BREAKER — {consecutive} consecutive losses, skipping",
@@ -317,7 +337,10 @@ def run(monitor: Monitor, run_id: str | None) -> None:
                 pos              = trader.positions[symbol]
                 entry_price      = pos["entry"]
                 candles_at_entry = pos.get("candles_at_entry", pos.get("entry_candle", 0))
-                candles_held     = len(prices) - candles_at_entry
+                # Against the monotonic index, not len(prices) — that list is
+                # capped at PRICE_HISTORY_SIZE so this difference was pinned
+                # to 0. See state.candle_index() (fixed 2026-08-08).
+                candles_held     = max(0, candle_index(state, symbol) - int(candles_at_entry))
                 profit_pct       = (price / entry_price) - 1 if entry_price else 0.0
 
                 if candles_held < min_hold:

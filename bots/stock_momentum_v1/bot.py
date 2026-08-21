@@ -263,6 +263,17 @@ def _log_to_supabase(
         print_status("SUPABASE_LOG_ERROR", str(e))
 
 
+def count_buys_today(log_file: str) -> int:
+    """Count ENTRIES only for today (ET).
+
+    MAX_TRADES_PER_DAY exists to limit churn and overtrading, which is a
+    property of how often we OPEN positions. Counting exits against it
+    meant a day with several stop-losses could exhaust the budget and
+    leave the remaining book unmanaged — see run_live_cycle.
+    """
+    return count_trades_today(log_file, events=["LIVE_BUY_SUBMITTED"])
+
+
 def print_status(event: str, details: str = "") -> None:
     msg = f"[BOT] {event}"
     if details:
@@ -270,14 +281,21 @@ def print_status(event: str, details: str = "") -> None:
     print(msg, flush=True)
 
 
-def count_trades_today(log_file: str) -> int:
+def count_trades_today(log_file: str, events: Optional[List[str]] = None) -> int:
     """
-    Count LIVE_BUY_SUBMITTED + LIVE_SELL_SUBMITTED events for today (ET).
+    Count order-submission events for today (ET).
+
+    `events` defaults to BUY + SELL. Pass ["LIVE_BUY_SUBMITTED"] to count
+    entries only — see count_buys_today and the note on MAX_TRADES_PER_DAY
+    in run_live_cycle for why that distinction matters.
 
     Prefers Supabase (the only source that persists across ephemeral GHA runs).
     Falls back to the local CSV if Supabase isn't configured — useful for local dev.
     """
     global supabase
+
+    if events is None:
+        events = ["LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"]
 
     # Prefer Supabase: persists across GHA runs, which the local CSV does not.
     if supabase is not None:
@@ -292,7 +310,7 @@ def count_trades_today(log_file: str) -> int:
             res = (
                 supabase.table("bot_logs")
                 .select("event", count="exact")  # type: ignore[arg-type]
-                .in_("event", ["LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"])
+                .in_("event", events)
                 .gte("timestamp_utc", day_start_utc_iso)
                 .execute()
             )
@@ -308,14 +326,14 @@ def count_trades_today(log_file: str) -> int:
 
     # Local CSV fallback (development / Supabase outage)
     if not os.path.exists(log_file):
-        return 0
+        return 0  # noqa: RET504
     tkey_et = today_key_et()
     n = 0
     with open(log_file, "r", newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
             ev = (row.get("event", "") or "").strip()
-            if ev not in ("LIVE_BUY_SUBMITTED", "LIVE_SELL_SUBMITTED"):
+            if ev not in events:
                 continue
             ts = (row.get("timestamp_utc", "") or "").strip()
             if not ts:
@@ -1589,10 +1607,41 @@ def run_live_cycle(
         append_log(log_file, "STOPPED", details="STOP file detected")
         return
 
+    # ── DAILY TRADE CAP — ENTRIES ONLY ─────────────────────────────────────
+    #
+    # FIXED 2026-08-08. This used to be:
+    #
+    #     trades_today = count_trades_today(log_file)   # BUYs *and* SELLs
+    #     if trades_today >= max_trades_per_day:
+    #         append_log(...); return
+    #
+    # ...which returned before the portfolio was even fetched. With
+    # MAX_TRADES_PER_DAY=5 counting both sides, three entries plus two
+    # stop-loss exits exhausted the cap — and every remaining open position
+    # was then left completely unmanaged for the rest of the ET day. No
+    # stop-loss, no take-profit, no DAILY_LOSS_LIMIT, no MAX_DRAWDOWN.
+    #
+    # The cap activates precisely on volatile days, which is exactly when
+    # unmanaged positions are most dangerous. It is the same defect as the
+    # MIN_HOLD bug: a CHURN control was silently governing RISK exits.
+    #
+    # Worse, the comment on the MIN_HOLD fix claimed this file already
+    # mirrored league_core/risk.py's rule that CLOSE actions bypass the
+    # daily cap. It did not. That was a description of a fix never applied
+    # here — so the code asserted a safety property it did not have.
+    #
+    # Now: the cap governs ENTRIES only, and is enforced in the buy loop.
+    # Exits always run.
+    buys_today = count_buys_today(log_file)
+    entries_blocked = buys_today >= max_trades_per_day
+    if entries_blocked:
+        append_log(log_file, "ENTRIES_CAPPED",
+            details=(f"buys_today={buys_today} >= max={max_trades_per_day} — "
+                     f"no new entries this cycle; ALL EXIT PATHS REMAIN ACTIVE"))
+        print_status("ENTRIES_CAPPED", f"{buys_today}/{max_trades_per_day} — exits still active")
+
+    # Retained for the per-order bookkeeping below (incremented on each fill).
     trades_today = count_trades_today(log_file)
-    if trades_today >= max_trades_per_day:
-        append_log(log_file, "SKIP", details=f"Trade limit reached (trades_today={trades_today})")
-        return
 
     state = load_state()
 
@@ -1714,12 +1763,25 @@ def run_live_cycle(
     # ----------------------------------------------------------
     in_lockdown = days_left is not None and days_left <= lockdown_days
     if in_lockdown and snapshots:
+        # Hardened 2026-08-08. Two problems here:
+        #   1. The daily trade cap could `break` a liquidation partway
+        #      through, leaving part of the book un-liquidated during a
+        #      withdrawal lockdown. A lockdown is not churn — it must
+        #      complete regardless of how many orders it takes.
+        #   2. place_market_sell_quantity was unguarded, so ONE failure
+        #      (halted symbol, transient 5xx) propagated out and abandoned
+        #      every remaining symbol. Now failures are per-symbol.
         for snap in snapshots:
-            if trades_today >= max_trades_per_day:
-                break
             sym = snap["symbol"]
             qty = snap["qty"]
-            result = client.place_market_sell_quantity(sym, qty)
+            try:
+                result = client.place_market_sell_quantity(sym, qty)
+            except Exception as lock_err:
+                append_log(log_file, "ORDER_ERROR", symbol=sym,
+                    details=f"LOCKDOWN sell failed: {lock_err}")
+                monitor.log_error("place_sell_lockdown", lock_err, symbol=sym, severity="critical")
+                print_status("ORDER_ERROR", f"{sym} LOCKDOWN sell failed — continuing")
+                continue
             trades_today += 1
             monitor.trade_count += 1
             log_trade(
@@ -1737,6 +1799,13 @@ def run_live_cycle(
                 details=f"LOCKDOWN days_left={days_left} qty={qty:.8f}",
             )
             print_status("SELL_SUBMITTED", f"{sym} LOCKDOWN qty={qty:.8f}")
+            # Book the close so Supabase doesn't keep showing an open position.
+            try:
+                notify_sell(sym, snap["last"], snap["pnl_pct"], snap["pnl_usd"],
+                            snap["value"], "lockdown")
+                close_position(sym, snap["last"], snap["pnl_pct"], snap["pnl_usd"], "lockdown")
+            except Exception:
+                pass
         save_state(state)
         return
 
@@ -1744,9 +1813,11 @@ def run_live_cycle(
     # Per-symbol kill switches + TP/SL (EXIT LOGIC)
     # ----------------------------------------------------------
     for snap in snapshots:
-        if trades_today >= max_trades_per_day:
-            break
-
+        # NOTE: the `if trades_today >= max_trades_per_day: break` that used
+        # to be here was removed 2026-08-08. It abandoned the exit loop
+        # mid-book, so whichever symbols happened to sort later kept running
+        # with no stop-loss and no kill switches. The cap now applies to
+        # entries only — see the ENTRIES_CAPPED block in this function.
         sym = snap["symbol"]
         qty = snap["qty"]
         pnl_pct = snap["pnl_pct"]
@@ -1767,11 +1838,33 @@ def run_live_cycle(
             if (sstate.get("halt_until_day_key_et") or "") < dkey:
                 sstate["halt_until_day_key_et"] = ""
 
-        if should_halt_symbol(sstate):
-            append_log(log_file, "SKIP", symbol=sym,
-                       details=f"HALTED cooldown={sstate.get('cooldown_until')} halt_day={sstate.get('halt_until_day_key_et')}")
-            print_status("SKIP", f"{sym} halted")
-            continue
+        # ── Halt / cooldown — ENTRY GATE ONLY ──────────────────────────────
+        #
+        # FIXED 2026-08-08. This used to `continue`, which skipped every exit
+        # path for a symbol under halt: momentum exit, take-profit,
+        # stop-loss, DAILY_LOSS_LIMIT and MAX_DRAWDOWN.
+        #
+        # Why that was dangerous: both flags are set IMMEDIATELY after
+        # place_market_sell_quantity returns HTTP 200 — which means the order
+        # was ACCEPTED, not FILLED. The fill is never verified. So if a
+        # market SELL is accepted and then rejected, cancelled, or expires
+        # unfilled (halted stock, near-close submission, fractional-share
+        # edge case), the position survives — and was then blacklisted from
+        # every exit path for up to LOSS_COOLDOWN_DAYS (deployed: 3).
+        #
+        # And note trigger_cooldown fires on the DYNAMIC_SL, DAILY_LOSS_LIMIT
+        # and MAX_DRAWDOWN paths — so the blackout landed specifically on
+        # positions that were already losing.
+        #
+        # Now it's computed, not obeyed, in the exit loop; the entry loop
+        # still honours it (see should_halt_symbol check there).
+        symbol_halted = should_halt_symbol(sstate)
+        if symbol_halted:
+            append_log(log_file, "HALTED_ENTRIES_ONLY", symbol=sym,
+                       details=(f"cooldown={sstate.get('cooldown_until')} "
+                                f"halt_day={sstate.get('halt_until_day_key_et')} — "
+                                f"no new entries; ALL EXIT PATHS REMAIN ACTIVE"))
+            print_status("HALTED", f"{sym} entries blocked — exits still active")
 
         # ── Authoritative entry lookup ──────────────────────────────────
         # Prefer the bot's own ledger (local sstate → Supabase positions row)
@@ -1915,6 +2008,18 @@ def run_live_cycle(
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
             sstate.pop("entry_date", None)
+            # Added 2026-08-08. peak_value/day_start_value are DOLLAR figures
+            # tied to the position that just closed. Leaving them behind means
+            # the next position in this symbol is measured against the old
+            # position's high-water mark: close a $15 position (peak 15.4),
+            # open a $9 one, and the day-roll computes dd = 1 - 9/15.4 = 41.6%
+            # — far past MAX_DRAWDOWN=0.08. That fires an immediate, unintended
+            # market sell of a brand-new healthy position, logs it as
+            # `max_drawdown` so it looks like the risk system working, and
+            # starts a 3-day cooldown. Allocations legitimately range ~$5.6-$15
+            # here, so the >8% shrink needed to trigger it is easy to hit.
+            sstate.pop("peak_value", None)
+            sstate.pop("day_start_value", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry if true_entry > 0 else None,
@@ -1984,6 +2089,31 @@ def run_live_cycle(
                 details=f"DAILY_LOSS_LIMIT entry={entry_price or 0:.2f} exit={current_price or 0:.2f} daily_ret={daily_ret:.4%} qty={qty:.8f}",
             )
             print_status("SELL_SUBMITTED", f"{sym} DAILY_LOSS_LIMIT daily={daily_ret:.2%}")
+            # Added 2026-08-08 — this branch and MAX_DRAWDOWN below were the
+            # only two exits that skipped close_position()/notify_sell() and
+            # left entry state behind. Three consequences, all silent:
+            #   1. The Supabase position row stayed status='open' forever, and
+            #      the entry loop then refused to ever re-buy that symbol
+            #      ("Open Supabase position exists; skipping buy") — one kill
+            #      switch fire permanently retired a ticker from the universe.
+            #   2. Those phantom rows poison the empty-portfolio guard, which
+            #      aborts the whole cycle (skipping TP/SL for EVERY symbol)
+            #      when Public reports no positions but Supabase shows some.
+            #   3. No Discord notice — the two most important exits in the
+            #      system were the only ones that told you nothing.
+            _kill_exit_price = float(current_price or 0)
+            try:
+                notify_sell(sym, _kill_exit_price, pnl_pct, pnl_usd, pos_value, "daily_loss_limit")
+                close_position(sym, _kill_exit_price, pnl_pct, pnl_usd, "daily_loss_limit")
+            except Exception as _bk_err:
+                append_log(log_file, "BOOKKEEPING_ERROR", symbol=sym,
+                    details=f"DAILY_LOSS_LIMIT close_position failed: {_bk_err}")
+            sstate.pop("entry_price", None)
+            sstate.pop("entry_amount", None)
+            sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
+            sstate.pop("peak_value", None)
+            sstate.pop("day_start_value", None)
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
             continue
@@ -2013,6 +2143,21 @@ def run_live_cycle(
                 details=f"MAX_DRAWDOWN entry={entry_price or 0:.2f} exit={current_price or 0:.2f} dd={dd:.4%} qty={qty:.8f}",
             )
             print_status("SELL_SUBMITTED", f"{sym} MAX_DRAWDOWN dd={dd:.2%}")
+            # See the DAILY_LOSS_LIMIT branch above for why this bookkeeping
+            # is here (added 2026-08-08).
+            _kill_exit_price = float(current_price or 0)
+            try:
+                notify_sell(sym, _kill_exit_price, pnl_pct, pnl_usd, pos_value, "max_drawdown")
+                close_position(sym, _kill_exit_price, pnl_pct, pnl_usd, "max_drawdown")
+            except Exception as _bk_err:
+                append_log(log_file, "BOOKKEEPING_ERROR", symbol=sym,
+                    details=f"MAX_DRAWDOWN close_position failed: {_bk_err}")
+            sstate.pop("entry_price", None)
+            sstate.pop("entry_amount", None)
+            sstate.pop("entry_day", None)
+            sstate.pop("entry_date", None)
+            sstate.pop("peak_value", None)
+            sstate.pop("day_start_value", None)
             sstate["halt_until_day_key_et"] = dkey
             trigger_cooldown(sstate, loss_cooldown_days)
             continue
@@ -2048,36 +2193,78 @@ def run_live_cycle(
                 print_status("SKIP", f"{sym} TP/SL no pnl_pct, no entry_price found")
                 continue
 
-        df = get_daily_bars(sym)
-        if df is None or len(df) < trend_slow + 5:
-            append_log(log_file, "SKIP", symbol=sym,
-                details=f"TP/SL skipped: insufficient bars (got {len(df) if df is not None else 0}, need {trend_slow + 5})")
-            print_status("SKIP", f"{sym} TP/SL insufficient bars")
-            continue
-
-        atr = calculate_atr(df, atr_period)
-        price = float(df["close"].iloc[-1])
-
-        if not price or not atr or atr / price < atr_vol_threshold:
-            atr_pct = (atr / price) if (atr and price) else 0.0
-            append_log(log_file, "SKIP", symbol=sym,
-                details=(
-                    f"TP/SL skipped: ATR gate "
-                    f"(price={price}, atr={atr}, atr/price={atr_pct:.4%} < threshold={atr_vol_threshold:.2%})"
-                ))
-            print_status("SKIP", f"{sym} TP/SL ATR gate atr_pct={atr_pct:.4%} < {atr_vol_threshold:.2%}")
-            continue
-
-        strength = trend_strength(df, trend_fast, trend_slow)
-
-        # Scale TP based on trend strength (from risk.py dynamic_take_profit)
-        scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
-        dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
+        # ── STOP LOSS IS NOT BAR-DEPENDENT — COMPUTE IT FIRST ──────────────
+        #
+        # RESTRUCTURED 2026-08-08. This block used to fetch daily bars and
+        # then `continue` on two conditions BEFORE reaching either the
+        # take-profit or the stop-loss comparison below:
+        #
+        #   1. insufficient bars   -> continue
+        #   2. atr/price < ATR_VOL_THRESHOLD (0.01) -> continue
+        #
+        # Both skipped the stop loss, and both were wrong to.
+        #
+        # (1) is a DATA failure. get_daily_bars returns None on any Polygon
+        #     outage, rate-limit or bad symbol. So a data-provider blip
+        #     disabled the stop loss for EVERY position simultaneously —
+        #     exits failing open on exactly the input we cannot trust.
+        #
+        # (2) is worse because it is PERMANENT. ATR_VOL_THRESHOLD is an
+        #     ENTRY-quality filter meaning "don't trade dead tape"; it was
+        #     copy-pasted into the exit path. SGOV sits near 0.05% ATR;
+        #     SCHD/SCHB/VTI run 0.6-0.9%. Every one of those is below the
+        #     1% threshold essentially always, so positions in the four
+        #     lowest-volatility names in STOCK_SYMBOLS had NO STOP LOSS AT
+        #     ALL, ever. SPY and QQQ lost theirs whenever tape went quiet.
+        #
+        # Note also that calculate_atr returns NaN on thin data, and
+        # `not NaN` is False while `NaN < 0.01` is also False — so a NaN ATR
+        # silently PASSED this gate. The gate's behaviour under bad data was
+        # not even self-consistent.
+        #
+        # The key realisation: dynamic_sl never needed the bars. It is
+        # stop_loss_base scaled by regime, both already in scope. Only the
+        # SCALED take-profit needs `strength`, which needs bars. So the stop
+        # is computed unconditionally, and a bar failure now degrades to
+        # "no take-profit this cycle" rather than "no risk control at all".
+        #
+        # Same principle as the MIN_HOLD fix above and league_core/risk.py:
+        # nothing may stand between a risk condition and the order that
+        # resolves it.
         dynamic_sl = stop_loss_base * (0.8 if regime == "bear" else 1.0)
 
-        # Add fee buffer so we only TP if gain meaningfully exceeds fees
-        fee_adjusted_tp = dynamic_tp + 0.003  # ~0.3% fee buffer per round trip
-        if pnl_pct >= fee_adjusted_tp:
+        # ── Everything below is for the SCALED TAKE-PROFIT only ────────────
+        tp_available = False
+        fee_adjusted_tp = None
+
+        df = get_daily_bars(sym)
+        if df is None or len(df) < trend_slow + 5:
+            append_log(log_file, "TP_SCALING_UNAVAILABLE", symbol=sym,
+                details=(f"insufficient bars (got {len(df) if df is not None else 0}, "
+                         f"need {trend_slow + 5}) — take-profit skipped this cycle; "
+                         f"STOP LOSS STILL ACTIVE at {dynamic_sl:.2%}"))
+            print_status("SKIP", f"{sym} TP unavailable (bars) — SL active")
+        else:
+            atr = calculate_atr(df, atr_period)
+            price = float(df["close"].iloc[-1])
+            atr_ok = bool(price) and bool(atr) and (atr == atr) and (atr / price >= atr_vol_threshold)
+            if not atr_ok:
+                atr_pct = (atr / price) if (atr and price and atr == atr) else 0.0
+                append_log(log_file, "TP_SCALING_UNAVAILABLE", symbol=sym,
+                    details=(f"ATR gate (price={price}, atr={atr}, "
+                             f"atr/price={atr_pct:.4%} < {atr_vol_threshold:.2%}) — "
+                             f"take-profit skipped; STOP LOSS STILL ACTIVE at {dynamic_sl:.2%}"))
+                print_status("SKIP", f"{sym} TP unavailable (ATR) — SL active")
+            else:
+                strength = trend_strength(df, trend_fast, trend_slow)
+                # Scale TP based on trend strength (from risk.py dynamic_take_profit)
+                scale = min(1 + (strength / trend_strong_threshold), max_position_scale)
+                dynamic_tp = take_profit_base * (1 + 0.5 * min(scale - 1, 1.5))
+                # Add fee buffer so we only TP if gain meaningfully exceeds fees
+                fee_adjusted_tp = dynamic_tp + 0.003  # ~0.3% fee buffer per round trip
+                tp_available = True
+
+        if tp_available and pnl_pct >= fee_adjusted_tp:
             try:
                 result = client.place_market_sell_quantity(sym, qty)
             except Exception as sell_err:
@@ -2103,6 +2290,18 @@ def run_live_cycle(
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
             sstate.pop("entry_date", None)
+            # Added 2026-08-08. peak_value/day_start_value are DOLLAR figures
+            # tied to the position that just closed. Leaving them behind means
+            # the next position in this symbol is measured against the old
+            # position's high-water mark: close a $15 position (peak 15.4),
+            # open a $9 one, and the day-roll computes dd = 1 - 9/15.4 = 41.6%
+            # — far past MAX_DRAWDOWN=0.08. That fires an immediate, unintended
+            # market sell of a brand-new healthy position, logs it as
+            # `max_drawdown` so it looks like the risk system working, and
+            # starts a 3-day cooldown. Allocations legitimately range ~$5.6-$15
+            # here, so the >8% shrink needed to trigger it is easy to hit.
+            sstate.pop("peak_value", None)
+            sstate.pop("day_start_value", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry if true_entry > 0 else None,
@@ -2153,6 +2352,18 @@ def run_live_cycle(
             sstate.pop("entry_amount", None)
             sstate.pop("entry_day", None)
             sstate.pop("entry_date", None)
+            # Added 2026-08-08. peak_value/day_start_value are DOLLAR figures
+            # tied to the position that just closed. Leaving them behind means
+            # the next position in this symbol is measured against the old
+            # position's high-water mark: close a $15 position (peak 15.4),
+            # open a $9 one, and the day-roll computes dd = 1 - 9/15.4 = 41.6%
+            # — far past MAX_DRAWDOWN=0.08. That fires an immediate, unintended
+            # market sell of a brand-new healthy position, logs it as
+            # `max_drawdown` so it looks like the risk system working, and
+            # starts a 3-day cooldown. Allocations legitimately range ~$5.6-$15
+            # here, so the >8% shrink needed to trigger it is easy to hit.
+            sstate.pop("peak_value", None)
+            sstate.pop("day_start_value", None)
             log_trade(
                 symbol=sym, side="SELL",
                 entry_price=true_entry if true_entry > 0 else None,
@@ -2204,13 +2415,17 @@ def run_live_cycle(
     if (
         trades_today < max_trades_per_day
         and total_exposure < cap_total
-        and safe_buying_power > 5
+        and safe_buying_power > 5.0   # >= Public's $5 fractional minimum
         and open_positions < max_open_positions
     ):
         # Buy candidates: union of momentum_symbols and all_managed, ranked by momentum
         buy_universe = list(dict.fromkeys(momentum_symbols + all_managed))
         for sym in buy_universe:
-            if trades_today >= max_trades_per_day:
+            # The daily cap lives HERE and only here — it governs entries.
+            # `entries_blocked` is the pre-cycle verdict; `buys_today` is
+            # incremented below as we fill, so a single cycle can't blow
+            # through the cap either.
+            if entries_blocked or buys_today >= max_trades_per_day:
                 break
             if open_positions >= max_open_positions:
                 break
@@ -2323,8 +2538,25 @@ def run_live_cycle(
             )
             alloc_value = raw_alloc * conf_factor * breakout_size_factor
 
-            if alloc_value < 1.0:
-                continue
+            # Public's fractional-share minimum is $5.00. The old floor here
+            # was $1.00, which let sub-minimum orders through to be rejected
+            # by the broker: MAX_ORDER_AMOUNT_USD=15 x conf_factor 0.75 x
+            # breakout_size_factor 0.5 = $5.625, and equity-constrained
+            # paths went lower still. That is the $5.625 order observed on
+            # the MSFT entry. Round up to the minimum when the budget allows
+            # it, otherwise skip and say why.
+            MIN_FRACTIONAL_USD = 5.0
+            if alloc_value < MIN_FRACTIONAL_USD:
+                if raw_alloc >= MIN_FRACTIONAL_USD:
+                    append_log(log_file, "SIZE_ROUNDED_UP", symbol=sym,
+                        details=(f"alloc ${alloc_value:.2f} < ${MIN_FRACTIONAL_USD:.2f} "
+                                 f"broker minimum; rounding up (raw=${raw_alloc:.2f})"))
+                    alloc_value = MIN_FRACTIONAL_USD
+                else:
+                    append_log(log_file, "SKIP", symbol=sym,
+                        details=(f"alloc ${alloc_value:.2f} and budget ${raw_alloc:.2f} "
+                                 f"both below ${MIN_FRACTIONAL_USD:.2f} broker minimum"))
+                    continue
 
             qty = alloc_value / price
             if qty <= 0:
@@ -2338,6 +2570,7 @@ def run_live_cycle(
                 monitor.log_error("place_buy", order_err, symbol=sym, severity="warning")
                 continue
             trades_today += 1
+            buys_today += 1          # governs the entry cap — see loop head
             monitor.trade_count += 1
             open_positions += 1
             total_pos_value += alloc_value

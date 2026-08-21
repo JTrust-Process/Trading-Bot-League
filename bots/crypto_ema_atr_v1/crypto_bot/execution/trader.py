@@ -12,7 +12,7 @@ from crypto_bot.exchange.public_api import (
 from crypto_bot.logging import supabase_logger
 from crypto_bot.logging.logger import log, log_error, log_warn
 from crypto_bot.notifications import discord
-from crypto_bot.state.state import record_win, record_loss, record_exit
+from crypto_bot.state.state import record_win, record_loss, record_exit, candle_index
 from crypto_bot.config.settings import (
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, is_dry_run, get_min_buying_power_buffer,
     get_atr_sl_multiplier, get_atr_tp_multiplier, get_crypto_fee_per_order,
@@ -205,7 +205,12 @@ class Trader:
         else:
             sl, tp, method = compute_stop_levels(symbol, fill_price, self.run_id)
 
-        candles_at_entry = len(self.state.get("price_history", {}).get(symbol, []))
+        # Monotonic index, NOT len(price_history) — that list is capped at
+        # PRICE_HISTORY_SIZE, so once saturated its length is constant and
+        # candles_held computed against it was permanently 0, which pinned
+        # `candles_held < MIN_HOLD_CANDLES` to True and killed the signal
+        # exit outright. See state.candle_index() (fixed 2026-08-08).
+        candles_at_entry = candle_index(self.state, symbol)
 
         self.positions[symbol] = {
             "entry":            fill_price,

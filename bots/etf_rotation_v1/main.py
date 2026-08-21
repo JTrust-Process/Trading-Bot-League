@@ -384,7 +384,12 @@ def _mark_positions_to_market(run_id: Optional[str]) -> None:
                 entry_price=entry,
                 amount_usd=float(pos.get("amount_usd") or (entry * qty)),
                 is_paper=bool(pos.get("is_paper", True)),
+                # MERGE, don't replace. upsert_position PATCHes `metadata`
+                # wholesale, so passing a bare dict here would destroy the
+                # {"dry_run": true} flag written at open — on the very first
+                # mark. Caught in the 2026-08-08 audit of this function.
                 metadata={
+                    **(pos.get("metadata") or {}),
                     "mark_price":   price,
                     "mark_pnl_usd": round(pnl_usd, 4),
                     "mark_pnl_pct": round(pnl_pct, 6),
@@ -562,7 +567,40 @@ def run_cycle() -> str:
                     trade_count += 1
 
         # Step 2: open each new-target symbol with an equal share of capital.
-        per_symbol = s["paper_capital"] / float(len(target_set)) if target_set else 0.0
+        #
+        # CAPPED 2026-08-08. Equal-weighting alone made the defensive
+        # rotation impossible to execute. RISK_OFF is a SINGLE symbol
+        # (SGOV), so per_symbol = paper_capital / 1 = the entire $1000 —
+        # against a registry max_order_usd of 250. risk.preflight refused
+        # the SGOV BUY every cycle, and would later refuse the SGOV SELL
+        # too (max_order_usd applies to closes as well), trapping the bot.
+        #
+        # The bull basket is 1000/4 = 250.00 exactly and passed only
+        # because the check is strictly `>`. Any change to ETF_PAPER_CAPITAL
+        # would have broken that leg as well.
+        #
+        # This is the risk-gate-blocks-the-resolving-action pattern again:
+        # the control worked exactly as written, and what it prevented was
+        # the bot protecting itself in a downturn. Nothing alerted — the
+        # 2026-07-31 regime change was refused four times and retried hourly
+        # for three days before anyone noticed.
+        _cap = league.get_max_order_usd()
+        _equal = s["paper_capital"] / float(len(target_set)) if target_set else 0.0
+        per_symbol = min(_equal, float(_cap)) if _cap else _equal
+        if _cap and _equal > float(_cap):
+            print(f"[etf] sizing capped by registry max_order_usd: "
+                  f"${_equal:.2f} -> ${per_symbol:.2f} per symbol "
+                  f"({len(target_set)} symbol(s) in target)")
+            league.log_event(
+                "SIZING_CAPPED",
+                message=(f"Equal-weight ${_equal:.2f}/symbol exceeds max_order_usd "
+                         f"${float(_cap):.2f}; sized down to ${per_symbol:.2f}. "
+                         f"Basket will deploy ${per_symbol * len(target_set):.2f} of "
+                         f"${s['paper_capital']:.2f} available."),
+                metadata={"equal_weight": _equal, "max_order_usd": float(_cap),
+                          "per_symbol": per_symbol, "n_symbols": len(target_set)},
+                run_id=run_id,
+            )
         for sym in to_open:
             price = _fetch_close(sym)
             if price is None or price <= 0:

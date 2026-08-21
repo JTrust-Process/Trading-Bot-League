@@ -167,20 +167,51 @@ def get_crypto_prices(symbols: list[str]) -> dict[str, float]:
 
 
 # ── Order placement ───────────────────────────────────────────────────────────
+#
+# !!! NO @retry ON ANYTHING IN THIS SECTION !!!
+#
+# Removed 2026-08-08. Both order functions were decorated `@retry(
+# max_attempts=3, delay=2)` while minting `uuid.uuid4()` INSIDE the function
+# body. utils/retry.py catches bare `Exception`, so every retry re-entered
+# the body and generated a DIFFERENT orderId.
+#
+# Public's idempotency is per-orderId. A different ID on each attempt means
+# it provides no protection at all — the whole point of sending an orderId
+# is defeated. A connection reset or a 5xx AFTER Public accepted the order
+# would place it again, and again:
+#
+#   BUY  -> up to 3x the intended position ($75 against a $25 cap),
+#           untracked, because trader.buy records ONE position sized from
+#           the first request.
+#   SELL -> oversell rejection; trader's handler returns without deleting
+#           the local position, leaving a ghost that _reconcile_with_public
+#           does not detect (it only handles Public-has/local-lacks).
+#
+# The stock bot states this rule explicitly at bot.py:729-731 — "NEVER call
+# this for order placement; idempotency on Public is per-orderId not
+# per-attempt, and a duplicate would mean a duplicate fill." This module was
+# doing exactly what that comment forbids.
+#
+# Retries remain on auth, account, quote and portfolio reads — all
+# idempotent GETs. Order placement is one shot. If the caller wants to
+# retry, it must pass the SAME client_order_id back in.
 
-@retry(max_attempts=3, delay=2)
 def place_order_buy(
     account_id: str,
     symbol: str,
     amount_usd: float,
     order_type: str = "MARKET",
+    client_order_id: str | None = None,
 ) -> dict:
     """
     BUY using notional USD amount — e.g. spend $10 of BTC.
     Public accepts `amount` for buys.
+
+    NOT retried — see the section header. Pass `client_order_id` to make a
+    caller-driven retry genuinely idempotent at Public.
     """
     url = ORDER_URL_TMPL.format(accountId=account_id)
-    order_id = str(uuid.uuid4())
+    order_id = client_order_id or str(uuid.uuid4())
     body = {
         "orderId": order_id,
         "instrument": {"symbol": symbol, "type": INSTRUMENT_TYPE},
@@ -196,19 +227,21 @@ def place_order_buy(
     return result
 
 
-@retry(max_attempts=3, delay=2)
 def place_order_sell(
     account_id: str,
     symbol: str,
     quantity: float,
     order_type: str = "MARKET",
+    client_order_id: str | None = None,
 ) -> dict:
     """
     SELL using exact quantity — e.g. sell 0.000138 BTC.
     Public requires `quantity` for sells when closing a position.
+
+    NOT retried — see the section header above.
     """
     url = ORDER_URL_TMPL.format(accountId=account_id)
-    order_id = str(uuid.uuid4())
+    order_id = client_order_id or str(uuid.uuid4())
     body = {
         "orderId": order_id,
         "instrument": {"symbol": symbol, "type": INSTRUMENT_TYPE},

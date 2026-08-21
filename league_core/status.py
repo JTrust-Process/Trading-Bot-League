@@ -449,6 +449,53 @@ def close_position(
     _patch(cfg, "bot_positions", f"id=eq.{existing['id']}", patch)
 
 
+def get_max_order_usd(bot_id: Optional[str] = None) -> Optional[float]:
+    """Return this bot's `max_order_usd` from bot_registry, or None.
+
+    Added 2026-08-08 so bots can SIZE to the cap rather than construct an
+    order the risk gate will refuse. Refusal is the correct behaviour for a
+    gate, but a bot that repeatedly builds orders it cannot place is just a
+    silent outage — see the etf_rotation_v1 bear-rotation deadlock, where a
+    $1000 single-symbol order met a $250 cap and the bot retried hourly for
+    three days.
+
+    Returns None on ANY failure or missing value. Callers must treat None
+    as "no known cap" and fall back to their own sizing — this is a
+    convenience for right-sizing, NOT a safety boundary. The enforcement
+    guarantee stays in risk.preflight, which is fail-closed.
+    """
+    cfg = _config()
+    if cfg is None or requests is None:
+        return None
+    target_bot_id = bot_id or cfg["bot_id"]
+    url = (
+        f"{cfg['url']}/rest/v1/bot_registry"
+        f"?bot_id=eq.{target_bot_id}&select=max_order_usd&limit=1"
+    )
+    headers = {
+        "apikey": cfg["key"],
+        "Authorization": f"Bearer {cfg['key']}",
+        "Accept": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=5.0)
+        if resp.status_code >= 400:
+            return None
+        rows = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    raw = rows[0].get("max_order_usd")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
+
+
 def get_bot_mode(bot_id: Optional[str] = None) -> str:
     """Return this bot's `mode` from bot_registry. Defaults to 'paper' on
     any failure — the SAFE default (no real-money code path).

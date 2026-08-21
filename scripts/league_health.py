@@ -31,12 +31,60 @@ import requests
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-STATE_FILE = "status_state.json"
+# Anchored to this file's directory, not the process CWD (fixed 2026-08-08).
+# It was a bare relative path, so it resolved against /app under the Fly
+# scheduler rather than /app/scripts as the Dockerfile comment claimed.
+# Both bot state modules already had this fix; this file never got it.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "status_state.json")
 
-# Heartbeat-age thresholds. Mirror the dashboard so users see the same
-# verdict on the page and in their Discord pings.
-HEARTBEAT_DEGRADED_MIN = 30
-HEARTBEAT_DOWN_MIN     = 120
+# ── Heartbeat-age thresholds ─────────────────────────────────────────────────
+#
+# REWORKED 2026-08-08. These were flat: 30 min degraded, 120 min down,
+# applied identically to every bot in the registry regardless of schedule.
+#
+# The actual cadences (agent_runner/scheduler.py):
+#   bond_research_v1    14:35 UTC daily      -> stale ~22h of every 24
+#   agent_research_v1   14:50 UTC daily      -> same
+#   etf_rotation_v1     :33 past 14-20 UTC   -> stale ~18h overnight + weekends
+#   short_watchlist_v1  :33 past 14-20 UTC   -> same
+#
+# So every League bot crossed 120 minutes every single evening and returned
+# to healthy every morning. should_ping fires on any bucket change, which is
+# ~8-10 Discord pings a day of pure noise — and a genuinely dead bot is
+# indistinguishable from the nightly churn. This is the third time
+# schedule-unaware health logic has produced false alerts here.
+#
+# Now: thresholds derive from each bot's expected interval, and a bot that
+# is simply outside its run window reads "idle", not "down".
+HEARTBEAT_DEGRADED_MIN = 30      # floor for fast bots
+HEARTBEAT_DOWN_MIN     = 120     # floor for fast bots
+
+# Expected run interval per bot, in minutes. Keep in sync with the crons in
+# agent_runner/scheduler.py. Unknown bots fall back to the flat floors.
+EXPECTED_INTERVAL_MIN = {
+    "etf_rotation_v1":    60,        # hourly within the session window
+    "short_watchlist_v1": 60,
+    "bond_research_v1":   24 * 60,   # once daily
+    "agent_research_v1":  24 * 60,
+    "stock_momentum_v1":  60,
+    "crypto_ema_atr_v1":  15,
+}
+
+
+def _thresholds_for(bot_id: str) -> tuple[float, float]:
+    """(degraded_min, down_min) scaled to this bot's cadence.
+
+    A daily bot must not be called "down" 121 minutes after its single run
+    of the day. Grace is ADDITIVE on top of the interval rather than a
+    multiplier — a 2.5x multiplier on a daily bot would allow 2.5 days of
+    silence before alerting, which is its own kind of uselessness.
+    """
+    interval = EXPECTED_INTERVAL_MIN.get(bot_id)
+    if not interval:
+        return (HEARTBEAT_DEGRADED_MIN, HEARTBEAT_DOWN_MIN)
+    return (max(HEARTBEAT_DEGRADED_MIN, interval + 20),
+            max(HEARTBEAT_DOWN_MIN,     interval * 2 + 20))
 
 # Max ping frequency while a bot stays in the same bad state.
 COOLDOWN_HOURS = 6
@@ -102,9 +150,23 @@ def _get(cfg: dict[str, str], path: str) -> Optional[list[dict]]:
         return None
 
 
-def fetch_views(cfg: dict[str, str]) -> list[BotView]:
-    """Join bot_registry with bot_status into a list of BotView objects."""
-    registry = _get(cfg, "bot_registry?select=*") or []
+def fetch_views(cfg: dict[str, str]) -> Optional[list[BotView]]:
+    """Join bot_registry with bot_status into a list of BotView objects.
+
+    Returns None if the REGISTRY itself could not be read — distinct from
+    an empty list, which means "read fine, no bots".
+
+    That distinction is the whole point (fixed 2026-08-08). This used to be
+    `_get(...) or []`, and main() then treated the empty result as "no bots
+    in registry; nothing to do" and exited 0. So if the League Supabase
+    project was down, the key expired, or RLS changed, the health monitor
+    reported success and said nothing — while every bot was also failing to
+    write. The monitor's own failure was the least visible failure in the
+    system, and it was silent precisely when it mattered most.
+    """
+    registry = _get(cfg, "bot_registry?select=*")
+    if registry is None:
+        return None
     statuses = _get(cfg, "bot_status?select=*") or []
     status_by_id = {s["bot_id"]: s for s in statuses if isinstance(s, dict)}
     out: list[BotView] = []
@@ -162,11 +224,16 @@ def derive(view: BotView) -> Verdict:
     if age_min is None:
         return Verdict("idle", "No heartbeat", ["Last heartbeat unknown."])
 
-    if age_min > HEARTBEAT_DOWN_MIN:
-        return Verdict("down", "Stale", [f"Last heartbeat {int(age_min)}m ago."])
+    degraded_min, down_min = _thresholds_for(view.bot_id)
 
-    if age_min > HEARTBEAT_DEGRADED_MIN:
-        reasons.append(f"Last heartbeat {int(age_min)}m ago.")
+    if age_min > down_min:
+        return Verdict("down", "Stale",
+                       [f"Last heartbeat {int(age_min)}m ago "
+                        f"(threshold {int(down_min)}m for this cadence)."])
+
+    if age_min > degraded_min:
+        reasons.append(f"Last heartbeat {int(age_min)}m ago "
+                       f"(expected every ~{EXPECTED_INTERVAL_MIN.get(view.bot_id, '?')}m).")
 
     if last_status in RUN_STATUS_DOWN:
         return Verdict("down", "Last run failed",
@@ -210,11 +277,19 @@ def save_state(state: dict[str, Any]) -> None:
 # ── Discord ──────────────────────────────────────────────────────────────────
 
 
-def discord_ping(content: str, embed: Optional[dict] = None) -> None:
+def discord_ping(content: str, embed: Optional[dict] = None) -> bool:
     webhook = os.getenv("LEAGUE_DISCORD_WEBHOOK_URL", "").strip()
+    # Returns True only if the message actually reached Discord (fixed
+    # 2026-08-08). The caller records last_ping_ts to start a 6-hour
+    # cooldown; recording that on a FAILED or SKIPPED send meant a bot could
+    # go down, the ping could fail, and the cooldown would suppress retries
+    # for six hours. With the webhook simply unset it was worse — the script
+    # printed "skipping ping" every 15 minutes, forever, alerting nobody.
     if not webhook:
-        print("[league_health] LEAGUE_DISCORD_WEBHOOK_URL not set; skipping ping")
-        return
+        print("[league_health] ⚠ LEAGUE_DISCORD_WEBHOOK_URL NOT SET — "
+              "no alert can ever be delivered. This monitor is running but "
+              "cannot reach you.")
+        return False
     payload: dict[str, Any] = {"content": content}
     if embed:
         payload["embeds"] = [embed]
@@ -222,8 +297,11 @@ def discord_ping(content: str, embed: Optional[dict] = None) -> None:
         resp = requests.post(webhook, json=payload, timeout=TIMEOUT_DISCORD)
         if resp.status_code >= 400:
             print(f"[league_health] discord status={resp.status_code} body={resp.text[:200]}")
+            return False
+        return True
     except Exception as e:  # noqa: BLE001
         print(f"[league_health] discord post failed: {e!r}")
+        return False
 
 
 _COLOR = {
@@ -284,6 +362,18 @@ def main() -> int:
         return 0
 
     views = fetch_views(cfg)
+    if views is None:
+        # The monitor is blind. Say so loudly — this is the one failure that
+        # cannot be detected by anything downstream, because everything
+        # downstream depends on this process reporting.
+        msg = ("✗ **league_health is BLIND** — cannot read `bot_registry` from "
+               "the League Supabase project. No bot health can be verified "
+               "until this is resolved. Check project status, LEAGUE_SUPABASE_KEY "
+               "expiry, and RLS policies.")
+        print(f"[league_health] REGISTRY UNREADABLE — {msg}")
+        discord_ping(msg)
+        return 1
+
     if not views:
         print("[league_health] no bots in registry; nothing to do")
         return 0
@@ -313,7 +403,9 @@ def main() -> int:
 
         if should_ping(prev, v.bot_id, verdict.bucket):
             transitions.append((v, verdict, prev_bucket))
-            new_state[v.bot_id]["last_ping_ts"] = time.time()
+            # last_ping_ts is now recorded AFTER a confirmed send, below —
+            # not here. Setting it optimistically started the 6h cooldown
+            # even when the ping failed or was skipped.
 
     print("[league_health] survey:")
     for line in summary_lines:
@@ -331,7 +423,11 @@ def main() -> int:
                 "idle":     "·",
             }.get(verdict.bucket, "?")
             content = f"{label} **{v.display_name}** ({v.bot_id}): {arrow}"
-            discord_ping(content, embed=embed_for(v, verdict))
+            if discord_ping(content, embed=embed_for(v, verdict)):
+                new_state[v.bot_id]["last_ping_ts"] = time.time()
+            else:
+                print(f"[league_health] ping for {v.bot_id} NOT delivered — "
+                      f"cooldown not started, will retry next cycle")
     else:
         print("[league_health] no transitions; no pings")
 

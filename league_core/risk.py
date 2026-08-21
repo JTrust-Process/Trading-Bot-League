@@ -79,6 +79,8 @@ REASON_DAILY_TRADES_CAP      = "daily_trades_cap_reached"
 REASON_NO_LEAGUE             = "league_not_configured"
 REASON_REGISTRY_FETCH_FAILED = "registry_fetch_failed"
 REASON_TRADE_COUNT_FAILED    = "trade_count_fetch_failed"
+REASON_ORDERS_NOT_PERMITTED  = "bot_cannot_place_orders"
+REASON_APPROVAL_REQUIRED     = "manual_approval_required"
 
 
 # ── Action taxonomy ─────────────────────────────────────────────────────────
@@ -228,6 +230,37 @@ def _evaluate_rules(
     # score, and propose ideas, but they cannot bypass risk controls."
     if (registry.get("bot_type") or "").lower() == "agent_research":
         return (False, REASON_AGENT_RESEARCH)
+
+    # §4.2.10  Per-bot order permission.
+    #
+    # ADDED 2026-08-08. `can_place_orders` and `manual_approval_required`
+    # were being SELECTed by _fetch_registry_row and then never read by
+    # anything. Three separate places asserted they were enforced:
+    #
+    #   * contracts.py claimed a "triple defense" across the dataclass, the
+    #     Supabase row and this gate — but BotConfig is never instantiated
+    #     anywhere in the repo, so its __post_init__ never runs.
+    #   * etf_rotation_v1's seed set can_place_orders=false with the comment
+    #     "paper-only; this bot never calls the order endpoint".
+    #   * _risk_smoke.py's fixture set it True, so the tests passed
+    #     identically either way and could never have caught this.
+    #
+    # Net effect: the most intuitive per-bot order kill switch in the whole
+    # system did nothing. etf_rotation_v1 has been placing real orders with
+    # can_place_orders=false. Anyone flipping that flag to stop a misbehaving
+    # bot would have watched it keep trading.
+    #
+    # CLOSE actions are exempt. Revoking a bot's permission to trade must
+    # not also strand its open positions — same principle as the daily-trade
+    # cap below.
+    is_close = action in CLOSE_ACTIONS
+    if not is_close:
+        can_place = registry.get("can_place_orders")
+        if can_place is not True:
+            return (False, REASON_ORDERS_NOT_PERMITTED)
+
+        if registry.get("manual_approval_required") is True:
+            return (False, REASON_APPROVAL_REQUIRED)
 
     # §4.2.4  Symbol allowlist. Convention: empty array OR ['*'] = "any".
     allowed = registry.get("allowed_instruments") or []

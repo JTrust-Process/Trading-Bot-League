@@ -66,6 +66,29 @@ primary_region = 'iad'
   # ── Shared ─────────────────────────────────────────────────────────────
   TZ = "America/New_York"
 
+  # ── etf_rotation_v1 (LIVE capital) ─────────────────────────────────────
+  #
+  # SET 2026-08-21. This was never set, so main.py fell back to its
+  # PAPER_CAPITAL_DEFAULT of 1000.0 — while the bot's registry row caps a
+  # single order at max_order_usd=110. The arithmetic made EVERY order
+  # impossible from the moment the bot went live:
+  #
+  #     bull basket (4 symbols):  1000 / 4 = $250   vs 110  -> REFUSED
+  #     bear basket (SGOV only):  1000 / 1 = $1000  vs 110  -> REFUSED
+  #
+  # That is exactly the 2026-07-31 incident: a real regime change fired,
+  # all four BUYs were refused `amount_exceeds_max_order_usd`, the bot
+  # retried hourly for three days, and nothing told anyone. The risk gate
+  # was working perfectly — it was refusing orders that should never have
+  # been constructed at that size.
+  #
+  # $100 keeps both baskets comfortably inside the $110 cap:
+  #     bull: 100 / 4 = $25/symbol      bear: 100 / 1 = $100
+  #
+  # RAISE THIS DELIBERATELY, NOT INCIDENTALLY. It is real money, and
+  # max_order_usd must be raised with it or the same deadlock returns.
+  ETF_PAPER_CAPITAL               = "100"
+
   # ── stock_momentum_v1 (STOCK_ prefix → stripped at job time) ──────────
   STOCK_MODE                      = "live"
   STOCK_RUN_ONCE                  = "1"

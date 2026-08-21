@@ -88,6 +88,47 @@ def append_price(state: dict, symbol: str, price: float) -> None:
     if len(history) > PRICE_HISTORY_SIZE:
         state["price_history"][symbol] = history[-PRICE_HISTORY_SIZE:]
 
+    # Monotonic candle counter (added 2026-08-08) — see candle_index().
+    # Must increment on EVERY append, including after the history is
+    # truncated, which is the whole reason it exists.
+    idx = state.setdefault("candle_index", {})
+    idx[symbol] = int(idx.get(symbol, len(history))) + 1
+
+
+def candle_index(state: dict, symbol: str) -> int:
+    """Monotonic count of candles observed for `symbol`.
+
+    WHY THIS EXISTS (bug found 2026-08-08):
+
+    `record_exit` and `candles_at_entry` used to store `len(price_history)`
+    as a candle "index", and `candles_since_exit` / `candles_held` computed
+    the difference against `len(price_history)` at read time.
+
+    But `append_price` CAPS that list at PRICE_HISTORY_SIZE. Once it
+    saturates — 20 hours in, on a 15-minute cadence, i.e. permanently —
+    `len(history)` is a CONSTANT. So:
+
+      * record_exit wrote PRICE_HISTORY_SIZE; candles_since_exit then
+        returned PRICE_HISTORY_SIZE - PRICE_HISTORY_SIZE = 0, forever.
+        The cooldown check `since_exit < COOLDOWN_CANDLES` was therefore
+        ALWAYS TRUE, so after its first exit the bot could never open
+        another position.
+
+      * candles_at_entry was likewise PRICE_HISTORY_SIZE, making
+        candles_held always 0, so `candles_held < MIN_HOLD_CANDLES` was
+        always true and the EMA-crossover SELL was permanently suppressed —
+        leaving STOP_LOSS and TAKE_PROFIT as the only ways out.
+
+    Both failures were completely silent: the logs read as ordinary
+    "cooldown active" and "too early to exit" lines.
+
+    Migration: for existing state, the counter seeds from len(history) on
+    first increment, which is the same magnitude the old scheme used. Stale
+    last_exit_candle values therefore behave as "cooldown starts now" and
+    then advance correctly, rather than staying pinned at zero.
+    """
+    return int(state.get("candle_index", {}).get(symbol, 0))
+
 
 def get_price_history(state: dict, symbol: str) -> list:
     return state.get("price_history", {}).get(symbol, [])
@@ -128,9 +169,11 @@ def record_exit(state: dict, symbol: str) -> None:
     """
     Record the candle index at which a position was closed.
     Used to enforce a cooldown before re-entering the same symbol.
+
+    Uses the monotonic candle_index, NOT len(price_history) — see
+    candle_index() for why that distinction is load-bearing.
     """
-    current_candle = len(state.get("price_history", {}).get(symbol, []))
-    state.setdefault("last_exit_candle", {})[symbol] = current_candle
+    state.setdefault("last_exit_candle", {})[symbol] = candle_index(state, symbol)
 
 
 def candles_since_exit(state: dict, symbol: str) -> int | None:
@@ -141,8 +184,11 @@ def candles_since_exit(state: dict, symbol: str) -> int | None:
     last_exit = state.get("last_exit_candle", {}).get(symbol)
     if last_exit is None:
         return None
-    current = len(state.get("price_history", {}).get(symbol, []))
-    return current - last_exit
+    delta = candle_index(state, symbol) - int(last_exit)
+    # Guard the migration boundary: a last_exit recorded under the old
+    # len(history) scheme can exceed a freshly-seeded counter, which would
+    # produce a negative "elapsed" and re-block entries. Treat as 0.
+    return max(0, delta)
 
 
 # ── Position desync tracking (NEW — startup reconciliation) ──────────────────
