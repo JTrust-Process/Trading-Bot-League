@@ -230,6 +230,34 @@ def _run_league_health() -> None:
         traceback.print_exc()
 
 
+def _run_missed_opps_scorer() -> None:
+    """Backfill forward returns on missed-opportunity rows. Phase 1 analytics.
+
+    ENTIRELY SEPARATE FROM TRADING. This job:
+      * places no orders and imports no order client;
+      * writes only bot_missed_opportunities;
+      * is registered only when MISSED_OPP_TRACKING is enabled;
+      * runs after the US close, when no trading job is scheduled;
+      * swallows every exception — a scorer failure must never mark the
+        machine unhealthy or disturb the next trading cycle.
+
+    Like league_health, it does not write bot_runs/bot_status for itself,
+    so it is NOT wrapped in _bot_env_scope. That matters: the scorer must
+    not inherit a per-bot env prefix.
+    """
+    log.info("→ job start: missed_opps_scorer")
+    fn = _safe_import("league_core.missed_opps", "main")
+    if fn is None:
+        log.error("× missed_opps_scorer aborted: import failed")
+        return
+    try:
+        rc = fn()
+        log.info("✓ missed_opps_scorer done rc=%s", rc)
+    except Exception as e:  # noqa: BLE001
+        log.error("× missed_opps_scorer crashed err=%r", e)
+        traceback.print_exc()
+
+
 # ── APScheduler event hooks (for visibility) ───────────────────────────────
 
 def _on_job_event(event):
@@ -346,6 +374,32 @@ def build_scheduler() -> BlockingScheduler:
         trigger=CronTrigger.from_crontab("9,24,39,54 * * * *", timezone="UTC"),
         id="league_health", name="league_health (every 15 min)",
     )
+
+    # ── Missed-opportunity scorer (Phase 1 analytics, OPT-IN) ───────────────
+    #
+    # Registered ONLY when MISSED_OPP_TRACKING is explicitly enabled. With
+    # the flag unset the job does not exist — it cannot fire, cannot appear
+    # in the startup banner, and cannot consume the single worker slot.
+    #
+    # 22:30 UTC on weekdays: comfortably after the 20:00 UTC US close
+    # (21:00 during EST) and well clear of every trading cron, which all
+    # sit in the 14-20 UTC window. Daily is the right cadence — forward
+    # returns only change once per trading day.
+    #
+    # max_workers=1 means jobs queue rather than overlap, so this is placed
+    # where it cannot delay a trading cycle even if it runs long.
+    if os.getenv("MISSED_OPP_TRACKING", "0").strip().lower() in ("1", "true", "yes", "on"):
+        sched.add_job(
+            _run_missed_opps_scorer,
+            trigger=CronTrigger.from_crontab("30 22 * * mon-fri", timezone="UTC"),
+            id="missed_opps_scorer",
+            name="missed_opps_scorer (weekdays 22:30 UTC, post-close)",
+        )
+        log.info("MISSED_OPP_TRACKING enabled — missed_opps_scorer SCHEDULED "
+                 "(analytics only; no trading impact)")
+    else:
+        log.info("MISSED_OPP_TRACKING not set — missed-opportunity tracking OFF "
+                 "(bot behaviour unchanged; scorer not scheduled)")
 
     sched.add_listener(_on_job_event,
                        EVENT_JOB_ERROR | EVENT_JOB_MISSED | EVENT_JOB_EXECUTED)

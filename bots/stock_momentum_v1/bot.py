@@ -17,6 +17,16 @@ from breakout import check_breakout
 from supabase import create_client
 from monitor import monitor
 import league_status  # ADDITIVE — fail-silent League heartbeat. Touches NO trading logic.
+# ADDITIVE — Phase 1 missed-opportunity observer. Read-only analytics.
+# Returns None, never raises, no-op unless MISSED_OPP_TRACKING is enabled.
+# Imported defensively so a missing/broken module cannot stop the bot.
+try:
+    from missed_opps_hook import record_skipped_candidate
+except BaseException as _mo_err:  # noqa: BLE001
+    print(f"[bot] missed-opportunity tracking unavailable (ignored): {_mo_err!r}")
+
+    def record_skipped_candidate(*_a, **_kw) -> None:  # type: ignore[misc]
+        return None
 from notify import (
     notify_buy, notify_sell, notify_run_start,
     notify_run_end, notify_error, notify_regime_change,
@@ -2484,6 +2494,31 @@ def run_live_cycle(
                 if mom_score and mom_score.valid:
                     reason = f"momentum rank={mom_score.rank} score={mom_score.score:.4f}, no breakout"
                 append_log(log_file, "SKIP", symbol=sym, details=reason)
+                # ── Phase 1 observer (added 2026-09-11) ───────────────────
+                # Records the candidate we just declined, so we can later
+                # measure whether declining it was right. Read-only: returns
+                # None, never raises, and is a no-op unless
+                # MISSED_OPP_TRACKING is explicitly enabled.
+                #
+                # Placement is deliberate — AFTER the decision and the
+                # existing SKIP log, immediately BEFORE the unchanged
+                # `continue`. It observes an outcome that is already final;
+                # it cannot influence one. The condition above, the reason
+                # string, and the `continue` below are all untouched.
+                record_skipped_candidate(
+                    sym, reason,
+                    score=(mom_score.score if (mom_score and mom_score.valid) else None),
+                    rank=(mom_score.rank if (mom_score and mom_score.valid) else None),
+                    regime=regime,
+                    signal_type=("momentum" if (mom_score and mom_score.valid) else None),
+                    run_id=getattr(monitor, "run_id", None),
+                    indicators={
+                        "momentum_top_n":   momentum_top_n,
+                        "breakout_checked": breakout_result is not None,
+                        "breakout_reason":  (breakout_result.reason
+                                             if breakout_result is not None else None),
+                    },
+                )
                 continue
 
             signal_type = "momentum" if momentum_signal else "breakout"
