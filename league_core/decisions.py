@@ -63,13 +63,16 @@ signal generalised to every bot — and they must be incapable of causing a
 trade by construction rather than by convention. `is_actionable` is a
 derived property with no setter; there is no way to mark a SKIP executable.
 
-One asymmetry that must survive into the executor: SELL and COVER must
-never be gated by throttles that gate BUY. Daily trade caps, cooldowns,
-minimum hold periods and circuit breakers are ENTRY concerns. Applying them
-to exits is how this system disabled its own stop-losses five separate
-times. league_core.risk already encodes this via CLOSE_ACTIONS; it is
-restated in CLOSE_ACTIONS below so a future implementer meets the rule
-before writing the executor, not after.
+One asymmetry that must survive into the executor: decisions that CLOSE a
+position must never be gated by throttles that gate ones that OPEN. Daily
+trade caps, cooldowns, minimum hold periods and circuit breakers are ENTRY
+concerns. Applying them to exits is how this system disabled its own
+stop-losses five separate times.
+
+Note carefully that this distinction is `position_effect`, NOT `action`.
+SELL is ambiguous — a long exit and a short entry are both SELL — so an
+executor keying the exemption on the action would let a short ENTRY bypass
+the entry cap. See the POSITION EFFECT section below.
 
 ────────────────────────────────────────────────────────────────────────────
 IMPORT POLICY
@@ -114,14 +117,69 @@ NON_ACTIONABLE = frozenset({HOLD, SKIP, ALERT})
 
 ACTIONS = ACTIONABLE | NON_ACTIONABLE
 
-#: Exit actions. These must NEVER be blocked by entry-side throttles —
-#: daily trade caps, cooldowns, minimum hold periods, circuit breakers.
-#: Mirrors league_core.risk.CLOSE_ACTIONS. See the module docstring for why
-#: this is stated twice rather than inferred.
+#: Action-level approximation of "this is an exit", mirroring
+#: league_core.risk.CLOSE_ACTIONS.
+#:
+#: ⚠ DEPRECATED AS A SOURCE OF TRUTH — use `position_effect` instead.
+#:
+#: Kept because league_core.risk currently keys its daily-trade-cap
+#: exemption on exactly this set, and the two must not silently diverge
+#: while that remains true. But the set is WRONG in one important case, and
+#: that case is why position_effect exists: see POSITION EFFECT below.
 CLOSE_ACTIONS = frozenset({SELL, COVER})
 
-#: Entry actions, subject to entry-side throttles.
+#: Action-level approximation of "this is an entry". Same caveat.
 OPEN_ACTIONS = frozenset({BUY})
+
+
+# ── Position effect ──────────────────────────────────────────────────────────
+#
+# WHY THIS FIELD EXISTS
+#
+# `action` alone cannot tell an entry from an exit. SELL is ambiguous:
+#
+#     long  SELL   sell shares you own            -> CLOSE
+#     short SELL   sell borrowed shares to open   -> OPEN
+#
+# Both are SELL. They are opposite in every way that matters to a risk
+# gate. This was found by short_watchlist_v1's decision mapper: a short
+# ENTRY mapped to SELL and the contract reported `is_close=True`, which is
+# exactly backwards — the one moment entry-side throttles most need to
+# apply is when a new position is being opened.
+#
+# So the entry/exit distinction is now carried EXPLICITLY, and `is_open` /
+# `is_close` derive from it rather than from the action.
+#
+# ⚠ CONSEQUENCE FOR RISK — READ BEFORE WIRING AN EXECUTOR
+#
+# league_core.risk exempts CLOSE_ACTIONS from the daily trade cap, keyed on
+# ACTION. Under that rule a short ENTRY (SELL + OPEN) would be treated as an
+# exit and bypass the entry cap entirely. No bot emits short entries through
+# the risk gate today — short_watchlist_v1 is paper and imports no order
+# client — so nothing is currently exposed. But any executor wiring shorts
+# to a live path MUST switch risk.py to key on position_effect first.
+# Recording that here because the gap is invisible from inside risk.py.
+
+OPEN = "OPEN"
+CLOSE = "CLOSE"
+NONE = "NONE"
+
+POSITION_EFFECTS = frozenset({OPEN, CLOSE, NONE})
+
+#: What each action means when the caller does not say. SELL defaults to
+#: CLOSE for long-only compatibility — every live bot in this system is
+#: long-only, so an unannotated SELL is overwhelmingly a long exit. A short
+#: entry must therefore be EXPLICIT about position_effect=OPEN, which is
+#: the right way round: the unusual, riskier case is the one that has to
+#: declare itself.
+DEFAULT_POSITION_EFFECT = {
+    BUY:   OPEN,
+    SELL:  CLOSE,
+    COVER: CLOSE,
+    HOLD:  NONE,
+    SKIP:  NONE,
+    ALERT: NONE,
+}
 
 
 # ── Asset classes ────────────────────────────────────────────────────────────
@@ -230,6 +288,32 @@ class BotDecision:
     #: signal worth alerting on, not a value to act upon.
     intended_mode: Optional[str] = None
 
+    #: OPEN / CLOSE / NONE. Whether this decision opens a position, closes
+    #: one, or does neither.
+    #:
+    #: Leave it None and it is resolved from DEFAULT_POSITION_EFFECT, which
+    #: is correct for every long-only case. A SHORT ENTRY must set OPEN
+    #: explicitly, because SELL defaults to CLOSE.
+    #:
+    #: ⚠ THIS IS DECISION INTENT, NOT EXECUTION AUTHORITY.
+    #:
+    #: It describes what the bot means to do. It does not establish that the
+    #: position exists, that the bot may trade, that shorting is permitted,
+    #: or that capital is available. Before any live order, League Core and
+    #: league_core.risk must independently verify:
+    #:
+    #:      actual holdings         does this position exist to be closed?
+    #:      resolved_mode           from bot_registry, never from the bot
+    #:      can_place_orders        from bot_registry
+    #:      allow_short             a short entry needs explicit permission
+    #:      buying power / caps     max_order_usd, exposure, minimum size
+    #:
+    #: A decision claiming CLOSE on a position that isn't held must be
+    #: refused, not executed. position_effect never shortens the risk path
+    #: and never exempts a decision from a check — it only makes the
+    #: entry/exit distinction legible to the checks that already exist.
+    position_effect: Optional[str] = None
+
     def __post_init__(self) -> None:
         # ── Required strings ──────────────────────────────────────────────
         for name in ("bot_id", "bot_type", "asset_class", "symbol", "action", "reason"):
@@ -270,6 +354,47 @@ class BotDecision:
                     f"got {self.intended_mode!r}"
                 )
             object.__setattr__(self, "intended_mode", mode)
+
+        # ── Position effect ───────────────────────────────────────────────
+        # Omitted -> resolved from the action. Supplied -> validated, and a
+        # contradiction is an ERROR rather than something quietly corrected.
+        # "SKIP, but treat it as opening a position" is not a typo to fix
+        # silently; it means the caller has misunderstood the contract, and
+        # that is worth surfacing at construction time in a test rather than
+        # at execution time in production.
+        if self.position_effect is None:
+            object.__setattr__(self, "position_effect",
+                               DEFAULT_POSITION_EFFECT[self.action])
+        else:
+            eff = str(self.position_effect).strip().upper()
+            if eff not in POSITION_EFFECTS:
+                raise DecisionValidationError(
+                    f"position_effect must be one of {sorted(POSITION_EFFECTS)} "
+                    f"or None, got {self.position_effect!r}"
+                )
+            if self.action in NON_ACTIONABLE and eff != NONE:
+                raise DecisionValidationError(
+                    f"action={self.action} is non-actionable and must have "
+                    f"position_effect={NONE}, got {eff}. A HOLD/SKIP/ALERT "
+                    f"does not open or close anything."
+                )
+            if self.action in ACTIONABLE and eff == NONE:
+                raise DecisionValidationError(
+                    f"action={self.action} is actionable and must be "
+                    f"{OPEN} or {CLOSE}, got {NONE}. If it neither opens nor "
+                    f"closes a position, it is a HOLD."
+                )
+            if self.action == BUY and eff != OPEN:
+                raise DecisionValidationError(
+                    f"BUY always opens a position; got position_effect={eff}. "
+                    f"To close a short, use {COVER}."
+                )
+            if self.action == COVER and eff != CLOSE:
+                raise DecisionValidationError(
+                    f"COVER always closes a short; got position_effect={eff}. "
+                    f"To open a short, use {SELL} with position_effect={OPEN}."
+                )
+            object.__setattr__(self, "position_effect", eff)
 
         # ── Numerics ──────────────────────────────────────────────────────
         conf = _clean_float(self.confidence, "confidence", allow_negative=True)
@@ -335,16 +460,26 @@ class BotDecision:
 
     @property
     def is_close(self) -> bool:
-        """True for SELL / COVER — an exit.
+        """True when this decision CLOSES a position.
 
-        An executor must not apply entry-side throttles when this is True.
+        Derived from position_effect, NOT from the action — a short entry
+        is a SELL that opens, and treating it as an exit is precisely the
+        bug this field was added to fix.
+
+        An executor must not apply entry-side throttles (daily trade caps,
+        cooldowns, minimum hold periods, circuit breakers) when this is
+        True. Those are entry concerns; applying them to exits is how this
+        system disabled its own stop-losses five separate times.
         """
-        return self.action in CLOSE_ACTIONS
+        return self.position_effect == CLOSE
 
     @property
     def is_open(self) -> bool:
-        """True for BUY — an entry. Entry-side throttles apply."""
-        return self.action in OPEN_ACTIONS
+        """True when this decision OPENS a position.
+
+        Covers BUY and a short SELL alike. Entry-side throttles apply.
+        """
+        return self.position_effect == OPEN
 
     # ── Serialisation ─────────────────────────────────────────────────────
 
@@ -369,6 +504,7 @@ class BotDecision:
             "asset_class": self.asset_class,
             "symbol": self.symbol,
             "action": self.action,
+            "position_effect": self.position_effect,
             "reason": self.reason,
             "confidence": self.confidence,
             "suggested_amount_usd": self.suggested_amount_usd,
@@ -386,6 +522,8 @@ __all__ = [
     "BUY", "SELL", "COVER", "HOLD", "SKIP", "ALERT",
     "ACTIONS", "ACTIONABLE", "NON_ACTIONABLE",
     "CLOSE_ACTIONS", "OPEN_ACTIONS",
+    "OPEN", "CLOSE", "NONE",
+    "POSITION_EFFECTS", "DEFAULT_POSITION_EFFECT",
     "ASSET_CLASSES",
     "BotDecision",
     "DecisionValidationError",

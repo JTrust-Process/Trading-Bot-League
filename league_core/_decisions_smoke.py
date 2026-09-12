@@ -91,13 +91,11 @@ def test_action_groups() -> None:
     check("groups are disjoint", not (d.ACTIONABLE & d.NON_ACTIONABLE))
     check("groups cover ACTIONS", (d.ACTIONABLE | d.NON_ACTIONABLE) == d.ACTIONS)
 
-    # Exits must be distinguishable so an executor can exempt them from
-    # entry-side throttles. Five separate incidents in this system came
-    # from failing to make that distinction.
-    check("SELL is_close", valid(action=d.SELL).is_close is True)
-    check("COVER is_close", valid(action=d.COVER).is_close is True)
-    check("BUY is_open", valid(action=d.BUY).is_open is True)
-    check("BUY not is_close", valid(action=d.BUY).is_close is False)
+    # Entry/exit is carried by position_effect, not by the action —
+    # see test_position_effect(). Defaults only, asserted here.
+    check("BUY defaults is_open", valid(action=d.BUY).is_open is True)
+    check("SELL defaults is_close", valid(action=d.SELL).is_close is True)
+    check("COVER defaults is_close", valid(action=d.COVER).is_close is True)
     check("SKIP neither open nor close",
           not valid(action=d.SKIP).is_close and not valid(action=d.SKIP).is_open)
 
@@ -260,13 +258,15 @@ def test_to_row() -> None:
     check("to_row() metadata is a copy", "injected" not in dec.metadata)
 
     expected = {
-        "bot_id", "bot_type", "asset_class", "symbol", "action", "reason",
+        "bot_id", "bot_type", "asset_class", "symbol", "action",
+        "position_effect", "reason",
         "confidence", "suggested_amount_usd", "suggested_quantity",
         "strategy_tags", "risk_notes", "metadata", "run_id",
         "intended_mode", "is_actionable",
     }
     check("exact key set", set(row) == expected,
           f"diff={set(row) ^ expected}")
+    check("position_effect in row", row["position_effect"] == d.NONE)
 
 
 # ── 14. Import policy ────────────────────────────────────────────────────────
@@ -316,6 +316,77 @@ def test_no_forbidden_imports() -> None:
               for n in tree.body))
 
 
+def test_position_effect() -> None:
+    """The long-SELL / short-SELL ambiguity, and its resolution.
+
+    `action` alone cannot distinguish a long exit from a short entry: both
+    are SELL. Found by short_watchlist_v1's decision mapper, where a short
+    ENTRY reported is_close=True — backwards, and dangerous precisely
+    because a future executor keying its entry-throttle exemption on
+    "is this a close?" would let a short entry bypass the daily cap.
+    """
+    print("\n[15] position_effect defaults")
+    check("BUY   -> OPEN", valid(action=d.BUY).position_effect == d.OPEN)
+    check("SELL  -> CLOSE (long-only default)",
+          valid(action=d.SELL).position_effect == d.CLOSE)
+    check("COVER -> CLOSE", valid(action=d.COVER).position_effect == d.CLOSE)
+    for a in (d.HOLD, d.SKIP, d.ALERT):
+        check(f"{a} -> NONE", valid(action=a).position_effect == d.NONE)
+    check("defaults table covers every action",
+          set(d.DEFAULT_POSITION_EFFECT) == d.ACTIONS)
+
+    print("\n[16] SELL may explicitly OPEN — the short-entry case")
+    short = valid(action=d.SELL, position_effect=d.OPEN)
+    check("accepted", short.position_effect == d.OPEN)
+    check("is_open True", short.is_open is True)
+    check("is_close False", short.is_close is False, "the original bug")
+    check("still actionable", short.is_actionable is True)
+    check("lowercase normalised",
+          valid(action=d.SELL, position_effect="open").position_effect == d.OPEN)
+
+    print("\n[17] is_open / is_close derive from position_effect, not action")
+    long_exit = valid(action=d.SELL)
+    check("same action, opposite effects",
+          long_exit.is_close is True and short.is_open is True)
+    check("both are SELL", long_exit.action == short.action == d.SELL)
+    check("BUY cannot be CLOSE",
+          raises(lambda: valid(action=d.BUY, position_effect=d.CLOSE)))
+    check("COVER cannot be OPEN",
+          raises(lambda: valid(action=d.COVER, position_effect=d.OPEN)))
+
+    print("\n[18] non-actionable decisions can never OPEN or CLOSE")
+    for a in (d.HOLD, d.SKIP, d.ALERT):
+        for eff in (d.OPEN, d.CLOSE):
+            check(f"{a} + {eff} rejected",
+                  raises(lambda x=a, e=eff: valid(action=x, position_effect=e)))
+        check(f"{a} + NONE allowed",
+              valid(action=a, position_effect=d.NONE).position_effect == d.NONE)
+        dec = valid(action=a)
+        check(f"{a} is neither open nor close",
+              dec.is_open is False and dec.is_close is False)
+
+    print("\n[19] actionable decisions can never be NONE")
+    for a in (d.BUY, d.SELL, d.COVER):
+        check(f"{a} + NONE rejected",
+              raises(lambda x=a: valid(action=x, position_effect=d.NONE)))
+
+    print("\n[20] invalid values rejected")
+    for bad in ("OPENING", "close_long", "", "   ", "SHORT", 1, True):
+        check(f"position_effect={bad!r} rejected",
+              raises(lambda b=bad: valid(position_effect=b)))
+
+    print("\n[21] position_effect is intent, not authority")
+    # It must not be possible to express "already approved" or "skip risk".
+    for f in ("allow_short", "position_verified", "skip_risk", "holdings_checked"):
+        check(f"{f} kwarg raises TypeError",
+              raises(lambda k=f: valid(**{k: True}), TypeError))
+    check("still no resolved_mode", not hasattr(short, "resolved_mode"))
+    check("docstring states intent-not-authority",
+          "NOT EXECUTION AUTHORITY" in (d.BotDecision.__doc__ or "")
+          or "not execution authority" in (
+              __import__("inspect").getsource(d.BotDecision).lower()))
+
+
 def main() -> int:
     print("=" * 66)
     print("league_core.decisions — dormant BotDecision contract")
@@ -326,6 +397,7 @@ def main() -> int:
     test_normalisation_and_defaults()
     test_trust_boundary()
     test_to_row()
+    test_position_effect()
     test_no_forbidden_imports()
     print("\n" + "=" * 66)
     print(f"  {_PASS} passed, {_FAIL} failed")

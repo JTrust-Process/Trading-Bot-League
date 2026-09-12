@@ -179,6 +179,14 @@ jobs:
       - name: Smoke — BotDecision contract (dormant)
         run: python -m league_core._decisions_smoke
 
+      # Phase C step 1: pure screener -> BotDecision mapper for
+      # short_watchlist_v1. Still dormant — this suite asserts, among other
+      # things, that main.py has NOT imported it. When that assertion
+      # starts failing, the dormancy claim needs re-verifying rather than
+      # the test being relaxed.
+      - name: Smoke — short_watchlist decision mapper (dormant)
+        run: python -m bots.short_watchlist_v1._decision_map_smoke
+
       # Cheap structural guards. Each encodes a rule that a reviewer would
       # otherwise have to remember, and each maps to a real incident.
       - name: Guard — analytics must not import trading code
