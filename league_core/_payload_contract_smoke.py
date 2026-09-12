@@ -212,12 +212,41 @@ class _FakeResp:
 
 def test_crypto() -> None:
     print("\n[3-4] crypto_ema_atr_v1 order bodies (network boundary patched)")
+
+    # IMPORT PATH — why this is not the obvious dotted import.
+    #
+    # crypto_bot/exchange/public_api.py uses ABSOLUTE package imports:
+    #
+    #     from crypto_bot.config.settings import get_public_api_key
+    #     from crypto_bot.utils.retry import retry
+    #
+    # so `crypto_bot` must be a TOP-LEVEL package on sys.path. Importing it
+    # as `bots.crypto_ema_atr_v1.crypto_bot.exchange.public_api` resolves
+    # the file but then fails executing line 6 with
+    # ModuleNotFoundError: No module named 'crypto_bot'.
+    #
+    # The bot's own wrapper does the same thing at main.py:36-38 — it adds
+    # its directory to sys.path before running anything. This mirrors that
+    # rather than inventing a different mechanism.
+    #
+    # NOT wrapped in a skip. A crypto payload that silently goes untested is
+    # worse than no test: the suite reports green while covering nothing,
+    # which is the exact failure mode this whole file exists to prevent.
+    # An import failure here is a FAILURE.
+    crypto_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bots", "crypto_ema_atr_v1",
+    )
+    if crypto_root not in sys.path:
+        sys.path.insert(0, crypto_root)
+
     try:
-        from bots.crypto_ema_atr_v1.crypto_bot.exchange import public_api as cx
+        from crypto_bot.exchange import public_api as cx
+        check("crypto: module imported", True)
     except Exception as e:  # noqa: BLE001
-        global _SKIP
-        _SKIP += 1
-        print(f"  SKIP  could not import crypto public_api: {e!r}")
+        check("crypto: module imported", False,
+              f"{e!r} — crypto BUY/SELL payloads are NOT covered. "
+              f"Expected crypto_bot importable from {crypto_root}")
         return
 
     captured: dict = {}
@@ -233,18 +262,44 @@ def test_crypto() -> None:
         cx.requests.post = fake_post
         cx._headers = lambda *a, **k: {"Authorization": "Bearer test"}
 
-        cx.place_order_buy("acct-1", "BTC", 10.0, client_order_id="cid-buy")
-        buy = captured.get("body") or {}
-        assert_common("crypto BUY", buy, inst_type="CRYPTO", side="BUY",
-                      money_key="amount", absent_money_key="quantity")
-        check("crypto BUY: honours client_order_id",
-              buy.get("orderId") == "cid-buy", f"got {buy.get('orderId')!r}")
+        # ── BUY ───────────────────────────────────────────────────────────
+        try:
+            cx.place_order_buy("acct-1", "BTC", 10.0, client_order_id="cid-buy")
+            buy_err = None
+        except Exception as e:  # noqa: BLE001
+            buy_err = e
+        check("crypto BUY: call completed", buy_err is None, repr(buy_err))
 
+        buy = captured.get("body")
+        check("crypto BUY: payload captured", isinstance(buy, dict) and bool(buy),
+              f"nothing reached the patched requests.post — got {buy!r}")
+        if isinstance(buy, dict) and buy:
+            assert_common("crypto BUY", buy, inst_type="CRYPTO", side="BUY",
+                          money_key="amount", absent_money_key="quantity")
+            check("crypto BUY: honours client_order_id",
+                  buy.get("orderId") == "cid-buy", f"got {buy.get('orderId')!r}")
+            check("crypto BUY: posts to api.public.com",
+                  str(captured.get("url", "")).startswith("https://api.public.com/"),
+                  str(captured.get("url")))
+
+        # ── SELL ──────────────────────────────────────────────────────────
         captured.clear()
-        cx.place_order_sell("acct-1", "BTC", 0.00012345, client_order_id="cid-sell")
-        sell = captured.get("body") or {}
-        assert_common("crypto SELL", sell, inst_type="CRYPTO", side="SELL",
-                      money_key="quantity", absent_money_key="amount")
+        try:
+            cx.place_order_sell("acct-1", "BTC", 0.00012345,
+                                client_order_id="cid-sell")
+            sell_err = None
+        except Exception as e:  # noqa: BLE001
+            sell_err = e
+        check("crypto SELL: call completed", sell_err is None, repr(sell_err))
+
+        sell = captured.get("body")
+        check("crypto SELL: payload captured", isinstance(sell, dict) and bool(sell),
+              f"nothing reached the patched requests.post — got {sell!r}")
+        if isinstance(sell, dict) and sell:
+            assert_common("crypto SELL", sell, inst_type="CRYPTO", side="SELL",
+                          money_key="quantity", absent_money_key="amount")
+            check("crypto SELL: honours client_order_id",
+                  sell.get("orderId") == "cid-sell", f"got {sell.get('orderId')!r}")
 
         # Regression guard: @retry on an order function, with the id minted
         # inside the call, meant a timeout after acceptance placed a SECOND
@@ -386,9 +441,24 @@ def main() -> int:
     print("\n" + "=" * 70)
     print(f"  {_PASS} passed, {_FAIL} failed, {_SKIP} skipped")
     print("=" * 70)
+
     if _FAIL:
         print("\nIf a failure is an INTENTIONAL new field, update this file in")
         print("the same commit that adds it. That diff is the whole point.")
+
+    # A skipped payload is an UNTESTED payload. Under SMOKE_STRICT (which CI
+    # sets) that is a failure, not a footnote — a suite reporting green while
+    # covering nothing is the precise failure mode this file exists to catch.
+    # Crypto silently skipped exactly once, on an import path error, and
+    # reported 67 passed. Never again.
+    if _SKIP and os.getenv("SMOKE_STRICT", "0").strip().lower() in (
+            "1", "true", "yes", "on"):
+        print(f"\n::error::{_SKIP} section(s) SKIPPED under SMOKE_STRICT=1.")
+        print("Skipped payloads are untested payloads. Failing the run.")
+        return 1
+    if _SKIP:
+        print(f"\nWARNING: {_SKIP} section(s) skipped — those payloads were "
+              f"NOT tested. Set SMOKE_STRICT=1 to make this fail.")
     return 1 if _FAIL else 0
 
 
