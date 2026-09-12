@@ -187,6 +187,23 @@ jobs:
       - name: Smoke — short_watchlist decision mapper (dormant)
         run: python -m bots.short_watchlist_v1._decision_map_smoke
 
+      # Pins the EXACT Public order bodies we send today, across all four
+      # payloads (league_core equities BUY/SELL, crypto BUY/SELL, stock
+      # BUY/SELL). Asserts the new Public fields — useMargin,
+      # equityMarketSession, openCloseIndicator, bracket, tax lots, limit,
+      # GTD — are all ABSENT.
+      #
+      # A failure here is not necessarily a bug: it may be an intentional
+      # new field. But it must then be an intentional TEST UPDATE in the
+      # same commit. That diff is the point.
+      #
+      # SMOKE_STRICT=1 so a missing dependency fails rather than skipping
+      # the stock-bot half of the coverage.
+      - name: Smoke — Public payload contract
+        env:
+          SMOKE_STRICT: "1"
+        run: python -m league_core._payload_contract_smoke
+
       # Cheap structural guards. Each encodes a rule that a reviewer would
       # otherwise have to remember, and each maps to a real incident.
       - name: Guard — analytics must not import trading code
