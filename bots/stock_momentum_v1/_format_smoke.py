@@ -59,17 +59,36 @@ def main() -> int:
     print("stock_momentum_v1 — None-safe log formatting")
     print("=" * 64)
 
-    # bot.py imports pandas / supabase / requests at module level. If the
-    # active interpreter lacks them this is an environment gap, not a code
-    # failure, so report it as a skip with guidance rather than a red test.
+    # bot.py imports pandas / supabase / requests at module level.
+    #
+    # On a developer machine missing those, a skip with guidance is more
+    # useful than a red test. In CI it is the opposite: a skip would mean
+    # this suite silently covers NOTHING while still reporting green, which
+    # is precisely the "surface confidently reporting something untrue"
+    # failure this whole test exists to catch.
+    #
+    # So CI sets SMOKE_STRICT=1 and an import failure becomes a hard fail.
+    strict = os.getenv("SMOKE_STRICT", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     try:
         import bot  # noqa: F401
         fmt_pct, fmt_money, fmt_float = bot.fmt_pct, bot.fmt_money, bot.fmt_float
     except Exception as e:  # noqa: BLE001
+        if strict:
+            print(f"\n  FAIL  SMOKE_STRICT=1 and bot.py could not be imported: {e!r}")
+            print("        The suite covers nothing in this state, so this is a")
+            print("        hard failure rather than a skip. Check that")
+            print("        agent_runner/requirements.txt installed cleanly.")
+            print("\n" + "=" * 64)
+            print("  0 passed, 1 failed, 0 skipped")
+            print("=" * 64)
+            return 1
         _SKIP += 1
         print(f"\n  SKIP  could not import bot.py: {e!r}")
         print("        Install the bot's deps into this interpreter, e.g.:")
         print("        pip install -r agent_runner/requirements.txt")
+        print("        (set SMOKE_STRICT=1 to make this a hard failure)")
         print("\n" + "=" * 64)
         print(f"  {_PASS} passed, {_FAIL} failed, {_SKIP} skipped")
         print("=" * 64)

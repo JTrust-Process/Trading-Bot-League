@@ -1,0 +1,236 @@
+# ============================================================================
+# smoke-tests.yml — safety smoke tests for Trading Bot League
+#
+# Runs on every push and pull request. Compiles the modules that matter and
+# runs the four smoke suites.
+#
+# ── THIS WORKFLOW NEVER TRADES ─────────────────────────────────────────────
+#
+# It has NO access to secrets and does not reference `secrets.*` anywhere.
+# A workflow cannot place an order it has no credentials for, which is a
+# stronger guarantee than a policy that it won't.
+#
+# Concretely, none of these are present in the job environment:
+#   PUBLIC_SECRET / PUBLIC_ACCOUNT_ID  -> no broker auth, no orders
+#   LEAGUE_SUPABASE_URL / _KEY         -> no League writes
+#   STOCK_/CRYPTO_ SUPABASE_*          -> no bot-project writes
+#   DISCORD_WEBHOOK_URL                -> no notifications
+#
+# The suites are built for exactly this: with no config, league_core.status
+# and league_core.risk take their fail-closed / no-op branches, which is a
+# behaviour worth testing rather than an obstacle.
+#
+# ── WHY THESE FOUR SUITES ──────────────────────────────────────────────────
+#
+# Each covers a defect that reached live capital:
+#
+#   _risk_smoke        the preflight gate. It is the last thing between a
+#                      bot and an order; `can_place_orders` sat unread in
+#                      this file's logic for weeks.
+#   _equities_smoke    order construction and preflight parsing.
+#   _format_smoke      a log line formatting None took down whole trading
+#                      cycles, skipping stop-losses, for five weeks.
+#   _missed_opps_smoke asserts Phase 1 analytics cannot touch trading.
+#
+# ── ADDING A SUITE ─────────────────────────────────────────────────────────
+#
+# Give it a `main()` returning 0/1, make it hermetic (no network, no
+# credentials), and add a step below. Do NOT add `continue-on-error` and do
+# NOT add secrets — a smoke test that needs a credential is an integration
+# test and belongs somewhere else.
+# ============================================================================
+
+name: smoke-tests
+
+on:
+  push:
+  pull_request:
+
+# Read-only token. This workflow only needs to check out code.
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the older run.
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Safety smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Belt-and-braces only. The suites set what they need internally
+      # (_equities_smoke sets PUBLIC_ACCOUNT_ID_SKIP_VALIDATION itself to
+      # stay hermetic). These make the intent explicit and protect against
+      # a future suite that forgets.
+      PUBLIC_DRY_RUN: "1"
+      PUBLIC_ACCOUNT_ID_SKIP_VALIDATION: "1"
+
+      # Phase 1 analytics stays OFF, matching production default.
+      MISSED_OPP_TRACKING: "0"
+
+      # Unbuffered output so a crash shows the logs leading up to it.
+      PYTHONUNBUFFERED: "1"
+
+      # NOTE: SMOKE_STRICT is deliberately NOT set here. It is scoped to the
+      # single step that reads it, so it cannot silently change the meaning
+      # of a future suite that adopts the same variable name.
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: agent_runner/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agent_runner/requirements.txt
+
+      - name: Show environment
+        run: |
+          python --version
+          pip --version
+          echo "--- installed ---"
+          pip list --format=columns
+
+      # Fails the job if a real credential ever leaks into this workflow.
+      # The value of "no secrets" is only as good as the thing enforcing it.
+      # NOTE ON SCOPE: this checks an explicit DENYLIST of project secrets by
+      # exact name. It deliberately does NOT pattern-match on substrings like
+      # "TOKEN" or "KEY", because GitHub populates the runner with many of
+      # its own variables (GITHUB_TOKEN, GITHUB_ACTIONS, GITHUB_REPOSITORY,
+      # GITHUB_SHA, CI, RUNNER_*) and a broad regex would fail every run on
+      # those. None of the names below are GitHub-provided, so a hit here
+      # always means a project credential was really introduced.
+      - name: Assert no credentials present
+        run: |
+          fail=0
+          for v in \
+              PUBLIC_SECRET PUBLIC_TOKEN PUBLIC_ACCOUNT_ID \
+              LEAGUE_SUPABASE_URL LEAGUE_SUPABASE_KEY \
+              SUPABASE_URL SUPABASE_KEY SUPABASE_ANON_KEY \
+              SUPABASE_SERVICE_KEY SUPABASE_SERVICE_ROLE_KEY \
+              STOCK_SUPABASE_URL STOCK_SUPABASE_SERVICE_KEY \
+              CRYPTO_SUPABASE_URL CRYPTO_SUPABASE_KEY \
+              CRYPTO_SUPABASE_SERVICE_KEY \
+              DISCORD_WEBHOOK_URL LEAGUE_DISCORD_WEBHOOK_URL \
+              HEALTH_DEADMAN_URL \
+              POLYGON_API_KEY \
+              ANTHROPIC_API_KEY OPENAI_API_KEY PERPLEXITY_API_KEY \
+              ; do
+            if [ -n "${!v:-}" ]; then
+              echo "::error::$v is set in the smoke-test job. These tests must"
+              echo "::error::run without credentials so they cannot reach a real"
+              echo "::error::broker, database, Discord, or LLM. Remove it."
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then exit 1; fi
+          echo "OK — no broker, database, Discord, or LLM credentials present."
+          echo "(GitHub's own GITHUB_*/CI/RUNNER_* vars are not checked and are fine.)"
+
+      - name: Compile modules
+        run: |
+          python -m py_compile \
+            bots/stock_momentum_v1/bot.py \
+            bots/stock_momentum_v1/notify.py \
+            agent_runner/scheduler.py \
+            league_core/missed_opps.py
+
+      # Compiling every Python file catches a syntax error in a module the
+      # explicit list above doesn't name. compileall returns nonzero on
+      # failure; -q keeps the log readable.
+      - name: Compile all bots and league_core
+        run: |
+          python -m compileall -q bots league_core agent_runner scripts
+
+      # SMOKE_STRICT=1 turns "could not import bot.py" from a SKIP into a
+      # hard failure. Without it a broken dependency install would let this
+      # suite print green while covering nothing -- the exact
+      # confidently-wrong-surface failure it exists to catch.
+      # Locally, with the variable unset, it still skips with guidance.
+      - name: Smoke — log formatting (stock_momentum_v1)
+        env:
+          SMOKE_STRICT: "1"
+        run: python -m bots.stock_momentum_v1._format_smoke
+
+      - name: Smoke — risk preflight gate
+        run: python -m league_core._risk_smoke
+
+      - name: Smoke — equities order client
+        run: python -m league_core._equities_smoke
+
+      - name: Smoke — missed-opportunity tracking
+        run: python -m league_core._missed_opps_smoke
+
+      # Cheap structural guards. Each encodes a rule that a reviewer would
+      # otherwise have to remember, and each maps to a real incident.
+      - name: Guard — analytics must not import trading code
+        run: |
+          if grep -nE "^\s*(from|import)\s+.*(public_api|equities|place_market|trader)" \
+               league_core/missed_opps.py \
+               bots/stock_momentum_v1/missed_opps_hook.py; then
+            echo "::error::The missed-opportunity layer imported something on the"
+            echo "::error::order path. Phase 1 is read-only analytics: it must not"
+            echo "::error::be able to place an order, not merely decline to."
+            exit 1
+          fi
+          echo "OK — analytics layer imports no trading code."
+
+      # Matches a real DECORATOR sitting directly above the def — not any
+      # mention of the word. public_api.py's own comment block explains the
+      # @retry removal at length, and a substring grep would flag that
+      # explanation as the violation it warns about.
+      - name: Guard — no retry decorator on order placement
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+
+          p = pathlib.Path(
+              "bots/crypto_ema_atr_v1/crypto_bot/exchange/public_api.py"
+          )
+          src = p.read_text(encoding="utf-8")
+
+          # A decorator line, then any further decorators, then the def.
+          # Comments cannot match: a comment line starts with '#'.
+          pattern = re.compile(
+              r"^@retry\b[^\n]*\n(?:^@[^\n]*\n)*^def\s+place_order_(?:buy|sell)\b",
+              re.MULTILINE,
+          )
+          hits = pattern.findall(src)
+          if hits:
+              print("::error::@retry is back on a crypto order function. Public's")
+              print("::error::idempotency is per-orderId and the id is minted inside")
+              print("::error::the call, so a retry places a SECOND real order --")
+              print("::error::up to 3x the intended position, untracked.")
+              sys.exit(1)
+
+          # Sanity: if the functions were renamed, this guard is silently
+          # dead. Fail loudly rather than pretend to still be protecting them.
+          for name in ("place_order_buy", "place_order_sell"):
+              if not re.search(rf"^def\s+{name}\b", src, re.MULTILINE):
+                  print(f"::error::{name} not found in {p}. This guard no longer")
+                  print("::error::covers anything -- update it to match the new name.")
+                  sys.exit(1)
+
+          print("OK -- order placement is not retried.")
+          PY
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Smoke tests" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Result: **${{ job.status }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ran without broker, database, Discord, or LLM credentials." >> "$GITHUB_STEP_SUMMARY"
+          echo "No live trading behaviour is exercised by this workflow." >> "$GITHUB_STEP_SUMMARY"
