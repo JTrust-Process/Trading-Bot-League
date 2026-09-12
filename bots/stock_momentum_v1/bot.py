@@ -195,6 +195,83 @@ def get_env_bool(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "y", "on")
 
 
+# -----------------------------
+# Safe formatting helpers (LOGGING ONLY)
+# -----------------------------
+#
+# ADDED 2026-09-11 after a real incident. These exist because an f-string in
+# a LOG line took down a trading cycle.
+#
+# WHAT HAPPENED
+#   The 2026-08-08 ATR restructure made `fee_adjusted_tp` legitimately None
+#   when take-profit scaling is unavailable (no bars, or ATR below
+#   ATR_VOL_THRESHOLD). The TP_SL_HOLD log at the bottom of the exit loop
+#   still formatted it with `{fee_adjusted_tp:.2%}`, which raises:
+#
+#       TypeError: unsupported format string passed to NoneType.__format__
+#
+#   That exception was raised INSIDE the per-symbol exit loop, which has no
+#   local handler, so it unwound all the way to main()'s `except Exception`.
+#   Every remaining symbol's stop-loss went unchecked, the entire entry loop
+#   was skipped, and save_state() never ran — because of a log line.
+#
+# THE RULE THIS ENCODES
+#   A logging statement must never be able to raise. Diagnostics exist to
+#   observe trading; they must not be able to interrupt it. Use these
+#   helpers for ANY value in a log/Discord/details string that could be
+#   None — which, after a `x = None` initialisation, is most of them.
+#
+#   These are for OUTPUT ONLY. Never use them to produce a value that feeds
+#   a comparison, a threshold, or an order. A stop-loss must compare real
+#   floats and fail loudly if one is missing; it must not silently compare
+#   against the string "N/A".
+
+
+def fmt_pct(value: Any, places: int = 2, na: str = "N/A") -> str:
+    """Format a DECIMAL ratio as a percentage. None-safe. Never raises.
+
+    fmt_pct(0.0342) -> '3.42%'   fmt_pct(None) -> 'N/A'
+    """
+    try:
+        if value is None:
+            return na
+        f = float(value)
+        if f != f:  # NaN
+            return na
+        return f"{f:.{places}%}"
+    except (TypeError, ValueError):
+        return na
+
+
+def fmt_money(value: Any, places: int = 2, na: str = "N/A") -> str:
+    """Format a USD amount. None-safe. Never raises.
+
+    fmt_money(12.5) -> '12.50'   fmt_money(None) -> 'N/A'
+    """
+    try:
+        if value is None:
+            return na
+        f = float(value)
+        if f != f:
+            return na
+        return f"{f:.{places}f}"
+    except (TypeError, ValueError):
+        return na
+
+
+def fmt_float(value: Any, places: int = 4, na: str = "N/A") -> str:
+    """Format a plain float. None-safe. Never raises."""
+    try:
+        if value is None:
+            return na
+        f = float(value)
+        if f != f:
+            return na
+        return f"{f:.{places}f}"
+    except (TypeError, ValueError):
+        return na
+
+
 def parse_symbols_env(key: str = "SYMBOLS", default: str = "SPY") -> List[str]:
     raw = get_env_str(key, default)
     if not raw:
@@ -2244,8 +2321,18 @@ def run_live_cycle(
         dynamic_sl = stop_loss_base * (0.8 if regime == "bear" else 1.0)
 
         # ── Everything below is for the SCALED TAKE-PROFIT only ────────────
+        #
+        # All four are reset PER SYMBOL. `strength` and `scale` were added to
+        # this reset on 2026-09-11: they are assigned only inside the `else`
+        # branch below, so on a symbol where TP scaling is unavailable they
+        # previously retained the PREVIOUS symbol's values and were logged as
+        # if they belonged to this one. On the first such symbol in a fresh
+        # process they were undefined entirely, raising NameError out of the
+        # cycle. Same class of fault as the None formatting below.
         tp_available = False
         fee_adjusted_tp = None
+        strength = None
+        scale = None
 
         df = get_daily_bars(sym)
         if df is None or len(df) < trend_slow + 5:
@@ -2403,10 +2490,24 @@ def run_live_cycle(
         else:
             # Position is held but neither TP nor SL triggered. Log the decision
             # so the dashboard shows *why* we didn't sell (instead of just nothing).
+            #
+            # FIXED 2026-09-11. This line previously used bare
+            # `{fee_adjusted_tp:.2%}`, `{strength:.4f}` and `{scale:.2f}`.
+            # After the 2026-08-08 ATR restructure, all three can legitimately
+            # be None/stale when take-profit scaling is unavailable, and the
+            # None case raised TypeError out of the whole cycle — skipping
+            # every remaining stop-loss check and the entire entry loop.
+            #
+            # Every value below now goes through a None-safe helper, so this
+            # statement cannot raise regardless of what the cycle computed.
+            # When TP scaling is off you get `tp=N/A strength=N/A scale=N/A`,
+            # which is the honest reading: those quantities were never
+            # calculated this cycle.
             append_log(log_file, "TP_SL_HOLD", symbol=sym,
                 details=(
-                    f"pnl={pnl_pct:.2%} between -sl={(-dynamic_sl):.2%} and tp={fee_adjusted_tp:.2%} "
-                    f"(strength={strength:.4f} scale={scale:.2f})"
+                    f"pnl={fmt_pct(pnl_pct)} between -sl={fmt_pct(-dynamic_sl if dynamic_sl is not None else None)} "
+                    f"and tp={fmt_pct(fee_adjusted_tp)} "
+                    f"(strength={fmt_float(strength)} scale={fmt_money(scale)})"
                 ))
 
     # ----------------------------------------------------------
@@ -2810,6 +2911,30 @@ def main() -> None:
             append_log(log_file, "ERROR", details=str(e))
             print_status("ERROR", str(e))
             notify_error("run_live_cycle", str(e), severity="warning")
+            # FIXED 2026-09-11 — why Discord used to report an error and then
+            # "SUCCESS, Errors 0" in the same cycle.
+            #
+            # notify_error() (notify.py:165) only posts to Discord. The run
+            # status at the bottom of this file is derived from
+            # monitor.error_count / monitor.critical_error, which ONLY
+            # monitor.log_error() increments. This handler called the former
+            # and not the latter, so a cycle that aborted with an exception
+            # still closed as 'success' with errors=0 — in bot_runs, in the
+            # League mirror, and in the health monitor that reads them.
+            #
+            # That is the same failure pattern as the rest of this system:
+            # nothing threw, and a surface confidently reported something
+            # untrue. The exception is real, so it is now recorded as one.
+            #
+            # severity='warning' (not 'critical') is deliberate: a single
+            # failed cycle should mark the run degraded, not mark the whole
+            # bot as failed. Note monitor.critical_error is sticky for the
+            # process lifetime, so 'critical' here would pin every later
+            # cycle to 'failed' until the machine restarts.
+            try:
+                monitor.log_error("run_live_cycle", e, severity="warning")
+            except Exception:
+                pass
 
         if run_once:
             return
