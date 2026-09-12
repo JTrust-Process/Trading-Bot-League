@@ -172,6 +172,13 @@ jobs:
       - name: Smoke — missed-opportunity tracking
         run: python -m league_core._missed_opps_smoke
 
+      # Phase B: dormant BotDecision contract. Nothing imports it yet, so
+      # this suite is the ONLY thing keeping it honest. It also asserts the
+      # module imports no broker/database/AI package — the property that
+      # lets a future executor trust it.
+      - name: Smoke — BotDecision contract (dormant)
+        run: python -m league_core._decisions_smoke
+
       # Cheap structural guards. Each encodes a rule that a reviewer would
       # otherwise have to remember, and each maps to a real incident.
       - name: Guard — analytics must not import trading code
