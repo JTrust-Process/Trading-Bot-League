@@ -214,6 +214,14 @@ jobs:
           SMOKE_STRICT: "1"
         run: python -m bots.stock_momentum_v1._monitor_smoke
 
+      # Phase 2: dormant Public payload builders. Nothing imports them.
+      # The load-bearing assertion is that the builders' DEFAULT output is
+      # byte-identical to what equities._build_payload sends in production
+      # — if they diverge, the model has stopped describing reality while
+      # still looking authoritative.
+      - name: Smoke — dormant Public payload builders
+        run: python -m league_core._public_payload_builders_smoke
+
       # Cheap structural guards. Each encodes a rule that a reviewer would
       # otherwise have to remember, and each maps to a real incident.
       - name: Guard — analytics must not import trading code
