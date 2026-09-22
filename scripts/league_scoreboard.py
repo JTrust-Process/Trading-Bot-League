@@ -586,6 +586,294 @@ def fmt_date(ts: Optional[str]) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  DETAIL MODE (--bot) — one bot, up close.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The overview answers "which bot should I look at?". This answers "what is
+# that bot actually doing?" — the question you otherwise answer by opening
+# the Supabase table editor and writing the same five queries by hand.
+#
+# Same rules as the overview: GET only, League project only, server-side
+# filters, URL-encoded, paginated. The bot_id filter is pushed into the
+# query rather than applied after, so a chatty bot cannot push a quiet
+# one's rows past the page limit.
+
+DETAIL_ROWS = 20          # per section
+
+DETAIL_SPECS: dict[str, dict[str, Any]] = {
+    "runs": {
+        "table": "bot_runs",
+        "select": ("id,started_at,ended_at,status,trade_count,error_count,"
+                   "duration_ms,trigger,notes"),
+        "ts": "started_at", "order": "started_at.desc",
+        "since_key": "started_at",
+    },
+    "trades": {
+        "table": "bot_trades",
+        "select": ("occurred_at,symbol,side,price,quantity,amount_usd,"
+                   "pnl_usd,pnl_pct,is_paper,strategy,reason,order_id"),
+        "ts": "occurred_at", "order": "occurred_at.desc",
+        "since_key": "occurred_at",
+    },
+    "positions": {
+        "table": "bot_positions",
+        "select": ("symbol,status,quantity,entry_price,entry_at,amount_usd,"
+                   "pnl_usd,is_paper,metadata,updated_at"),
+        "ts": "updated_at", "order": "updated_at.desc",
+        # Deliberately unwindowed: an open position may predate --since and
+        # still be open. ETF has held four since May.
+        "since_key": None,
+    },
+    "errors": {
+        "table": "bot_errors",
+        "select": "occurred_at,stage,symbol,severity,error_type,message",
+        "ts": "occurred_at", "order": "occurred_at.desc",
+        "since_key": "occurred_at",
+    },
+    "events": {
+        "table": "bot_events",
+        "select": "occurred_at,event_type,symbol,message",
+        "ts": "occurred_at", "order": "occurred_at.desc",
+        "since_key": "occurred_at",
+    },
+}
+
+
+def build_detail_query(
+    spec: dict[str, Any], bot_id: str, since: Optional[str] = None,
+    *, limit: int = DETAIL_ROWS,
+) -> str:
+    """One bot's slice of a table. Pure. URL-encoded, filtered server-side.
+
+    No pagination: every section is capped at `limit` rows by design — this
+    is a "latest N" view, not an aggregate. Because the cap is intentional
+    rather than accidental, a full page here means "there are more, as
+    expected", not "data may be missing". That is the opposite of the
+    overview, where a full page was a silent truncation bug.
+    """
+    params: list[tuple[str, str]] = [
+        ("select", spec["select"]),
+        ("bot_id", f"eq.{bot_id}"),
+    ]
+    since_key = spec.get("since_key")
+    if since_key and since:
+        params.append((since_key, f"gte.{since}"))
+    if spec.get("order"):
+        params.append(("order", spec["order"]))
+    params.append(("limit", str(int(limit))))
+    return f"{spec['table']}?{urlencode(params)}"
+
+
+def _cell(v: Any, width: int, *, num: bool = False, places: int = 2) -> str:
+    """Render one table cell. None becomes '—', never 0 or ''."""
+    if v is None or v == "":
+        return f"{'—':>{width}}" if num else f"{'—':<{width}}"
+    if num:
+        f = _num(v)
+        return f"{'—':>{width}}" if f is None else f"{f:>{width}.{places}f}"
+    s = str(v)
+    return f"{s[:width]:<{width}}"
+
+
+def _section(title: str, rows: Optional[list[dict]], render) -> list[str]:
+    """One detail section, with an honest empty/unreadable distinction.
+
+    `None` means the fetch FAILED. Printing "none" for that would be a
+    false statement about the bot rather than about the query — the same
+    class of error as reporting 0 runs when the query was truncated.
+    """
+    out = ["", title, "-" * 100]
+    if rows is None:
+        out.append("  ⚠ UNREADABLE — this table could not be fetched. "
+                   "Its absence below is NOT evidence of no activity.")
+        return out
+    if not rows:
+        out.append("  (none in this window)")
+        return out
+    out.extend(render(rows))
+    return out
+
+
+def render_bot_detail(
+    bot_id: str,
+    reg: Optional[dict[str, Any]],
+    status: Optional[dict[str, Any]],
+    sections: dict[str, Optional[list[dict]]],
+    since: Optional[str],
+) -> str:
+    """Assemble the --bot report. Pure given its inputs — no IO."""
+    L: list[str] = []
+    window = "ALL TIME" if since is None else f"since {since}"
+    L.append("=" * 100)
+    L.append(f"  BOT DETAIL — {bot_id}   ({window})")
+    L.append(f"  read-only, League project only, no market data")
+    L.append("=" * 100)
+
+    # ── 1. Header ─────────────────────────────────────────────────────────
+    if reg is None and status is None:
+        L.append("")
+        L.append(f"  ⚠ {bot_id} not found in bot_registry or bot_status.")
+        L.append("    Either the id is wrong, or the bot has never registered.")
+    r, s = reg or {}, status or {}
+    L.append("")
+    L.append(f"  type          {r.get('bot_type') or '—'}")
+    L.append(f"  mode          {r.get('mode') or '—'}")
+    L.append(f"  registry      {r.get('status') or '—'}"
+             f"   can_place_orders={r.get('can_place_orders')}"
+             f"   max_order_usd={r.get('max_order_usd')}")
+    L.append(f"  health        {s.get('health') or '—'}")
+    L.append(f"  heartbeat     {(s.get('last_heartbeat_at') or '—')[:19]}")
+    L.append(f"  last run      {s.get('last_run_status') or '—'}"
+             f"   id={s.get('last_run_id') or '—'}")
+    if s.get("last_error_msg"):
+        L.append(f"  last error    {str(s.get('last_error_msg'))[:80]}")
+
+    # ── 2. Runs ───────────────────────────────────────────────────────────
+    def _runs(rows):
+        o = [f"  {'started':<20}{'ended':<20}{'status':<9}"
+             f"{'trades':>7}{'errors':>7}{'dur(s)':>9}  notes"]
+        for x in rows[:DETAIL_ROWS]:
+            dur = _num(x.get("duration_ms"))
+            note = ""
+            st = (x.get("status") or "").lower()
+            if st == "running":
+                note = "ORPHANED? still 'running'"
+            elif st in ("failed", "timeout"):
+                note = "FAILED"
+            elif st == "warning":
+                note = "degraded"
+            if x.get("notes"):
+                note = f"{note} | {str(x['notes'])[:40]}".strip(" |")
+            o.append(
+                f"  {_cell(str(x.get('started_at') or '')[:19], 20)}"
+                f"{_cell(str(x.get('ended_at') or '')[:19], 20)}"
+                f"{_cell(x.get('status'), 9)}"
+                f"{_cell(x.get('trade_count'), 7, num=True, places=0)}"
+                f"{_cell(x.get('error_count'), 7, num=True, places=0)}"
+                f"{_cell(dur / 1000.0 if dur else None, 9, num=True, places=1)}"
+                f"  {note}")
+        return o
+
+    L.extend(_section(f"RECENT RUNS (latest {DETAIL_ROWS})",
+                      sections.get("runs"), _runs))
+
+    # ── 3. Trades ─────────────────────────────────────────────────────────
+    def _trades(rows):
+        o = [f"  {'occurred':<20}{'sym':<8}{'side':<6}{'price':>10}"
+             f"{'qty':>12}{'amt$':>9}{'pnl$':>9}{'pnl%':>8}  {'L/P':<4}strategy"]
+        for x in rows[:DETAIL_ROWS]:
+            pp = _num(x.get("pnl_pct"))
+            o.append(
+                f"  {_cell(str(x.get('occurred_at') or '')[:19], 20)}"
+                f"{_cell(x.get('symbol'), 8)}"
+                f"{_cell(x.get('side'), 6)}"
+                f"{_cell(x.get('price'), 10, num=True)}"
+                f"{_cell(x.get('quantity'), 12, num=True, places=8)}"
+                f"{_cell(x.get('amount_usd'), 9, num=True)}"
+                f"{_cell(x.get('pnl_usd'), 9, num=True)}"
+                f"{(f'{pp * 100:7.2f}%' if pp is not None else '       —')}"
+                f"  {'PAPER' if x.get('is_paper') else 'LIVE ':<4}"
+                f"{str(x.get('strategy') or '—')[:22]}")
+        # Live and paper are listed together here but never AGGREGATED —
+        # the L/P column is the whole point. Any summing belongs in the
+        # overview, which keeps them in separate columns.
+        o.append("")
+        o.append("  L/P column separates live from paper. This section does "
+                 "NOT total them.")
+        return o
+
+    L.extend(_section(f"RECENT TRADES (latest {DETAIL_ROWS})",
+                      sections.get("trades"), _trades))
+
+    # ── 4. Open positions ─────────────────────────────────────────────────
+    def _positions(rows):
+        open_rows = [x for x in rows if (x.get("status") or "") == "open"]
+        if not open_rows:
+            return ["  (no open positions)"]
+        o = [f"  {'symbol':<8}{'entry_at':<20}{'entry':>10}{'qty':>12}"
+             f"{'amt$':>9}{'mark_pnl$':>11}  {'L/P':<6}age"]
+        for x in open_rows:
+            meta = x.get("metadata") or {}
+            mark = meta.get("mark_pnl_usd") if isinstance(meta, dict) else None
+            entry_at = str(x.get("entry_at") or "")[:19]
+            age = ""
+            try:
+                if entry_at:
+                    d = (datetime.now(timezone.utc)
+                         - datetime.fromisoformat(entry_at.replace("Z", "+00:00"))
+                         .replace(tzinfo=timezone.utc)).days
+                    age = f"{d}d"
+            except Exception:  # noqa: BLE001
+                age = ""
+            o.append(
+                f"  {_cell(x.get('symbol'), 8)}"
+                f"{_cell(entry_at, 20)}"
+                f"{_cell(x.get('entry_price'), 10, num=True)}"
+                f"{_cell(x.get('quantity'), 12, num=True, places=8)}"
+                f"{_cell(x.get('amount_usd'), 9, num=True)}"
+                f"{_cell(mark, 11, num=True)}"
+                f"  {'PAPER' if x.get('is_paper') else 'LIVE ':<6}{age}")
+        o.append("")
+        o.append("  ⚠ mark_pnl$ is UNREALIZED and UNAUDITED. It is read from")
+        o.append("    bot_positions.metadata.mark_pnl_usd, written by the bot's")
+        o.append("    own mark-to-market — not from a broker statement, and not")
+        o.append("    from the pnl_usd column (which means REALIZED elsewhere).")
+        o.append("    A blank means the position has never been marked at all.")
+        return o
+
+    L.extend(_section("OPEN POSITIONS", sections.get("positions"), _positions))
+
+    # ── 5. Errors ─────────────────────────────────────────────────────────
+    def _errors(rows):
+        o = [f"  {'occurred':<20}{'stage':<14}{'sym':<7}{'sev':<9}message"]
+        for x in rows[:DETAIL_ROWS]:
+            o.append(
+                f"  {_cell(str(x.get('occurred_at') or '')[:19], 20)}"
+                f"{_cell(x.get('stage'), 14)}"
+                f"{_cell(x.get('symbol'), 7)}"
+                f"{_cell(x.get('severity'), 9)}"
+                f"{str(x.get('message') or '')[:44]}")
+        return o
+
+    L.extend(_section(f"RECENT ERRORS (latest {DETAIL_ROWS})",
+                      sections.get("errors"), _errors))
+
+    # ── 6. Events ─────────────────────────────────────────────────────────
+    def _events(rows):
+        o = [f"  {'occurred':<20}{'event':<22}{'sym':<7}message"]
+        for x in rows[:DETAIL_ROWS]:
+            o.append(
+                f"  {_cell(str(x.get('occurred_at') or '')[:19], 20)}"
+                f"{_cell(x.get('event_type'), 22)}"
+                f"{_cell(x.get('symbol'), 7)}"
+                f"{str(x.get('message') or '')[:44]}")
+        return o
+
+    L.extend(_section(f"RECENT EVENTS (latest {DETAIL_ROWS})",
+                      sections.get("events"), _events))
+
+    L.append("")
+    L.append("=" * 100)
+    L.append("  Each section shows the latest rows only — a full section means")
+    L.append("  'more exist', not 'data missing'. For totals use the overview:")
+    L.append("    python -m scripts.league_scoreboard")
+    L.append("=" * 100)
+    return "\n".join(L)
+
+
+def fetch_bot_detail(
+    cfg: dict[str, str], bot_id: str, since: Optional[str],
+    *, getter: Any = None,
+) -> dict[str, Optional[list[dict]]]:
+    """Fetch every detail section for one bot. GET only."""
+    fetch = getter or _get
+    out: dict[str, Optional[list[dict]]] = {}
+    for key, spec in DETAIL_SPECS.items():
+        out[key] = fetch(cfg, build_detail_query(spec, bot_id, since))
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  READ LAYER — GET only.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -830,6 +1118,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help=f"window start (default {DEFAULT_SINCE})")
     ap.add_argument("--all", action="store_true",
                     help="all-time; includes the pre-2026-08-09 system")
+    ap.add_argument("--bot", metavar="BOT_ID",
+                    help="focused detail report for one bot instead of the "
+                         "overview (e.g. --bot stock_momentum_v1)")
     args = ap.parse_args(argv)
 
     try:
@@ -844,6 +1135,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("[scoreboard] This script is read-only and needs only those two.")
         return 2
 
+    # ── Detail mode ───────────────────────────────────────────────────────
+    if args.bot:
+        bot_id = args.bot.strip()
+        if not bot_id:
+            print("[scoreboard] --bot requires a bot_id")
+            return 2
+        reg_rows = _get(cfg, build_detail_query(
+            {"table": "bot_registry", "select": "*", "order": None,
+             "since_key": None}, bot_id, None, limit=1))
+        st_rows = _get(cfg, build_detail_query(
+            {"table": "bot_status", "select": "*", "order": None,
+             "since_key": None}, bot_id, None, limit=1))
+        sections = fetch_bot_detail(cfg, bot_id, since)
+        if all(v is None for v in sections.values()) and reg_rows is None:
+            print(f"[scoreboard] could not read any table for {bot_id} — "
+                  f"reporting nothing rather than an empty detail page that "
+                  f"looks like 'this bot does nothing'.")
+            return 1
+        print(render_bot_detail(
+            bot_id,
+            (reg_rows or [None])[0] if reg_rows else None,
+            (st_rows or [None])[0] if st_rows else None,
+            sections, since,
+        ))
+        return 0
+
+    # ── Overview (unchanged) ──────────────────────────────────────────────
     data, meta = fetch_all(cfg, since)
     if data.get("registry") is None and data.get("runs") is None:
         print("[scoreboard] could not read bot_registry or bot_runs — "

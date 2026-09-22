@@ -323,6 +323,182 @@ def test_report_is_pure() -> None:
 
 # ── 8. Read-only guarantees ──────────────────────────────────────────────────
 
+def test_bot_detail() -> None:
+    print("\n[12] --bot detail mode")
+
+    print("\n[12a] bot_id is pushed SERVER-SIDE, with --since")
+    for key in ("runs", "trades", "errors", "events"):
+        q = sb.build_detail_query(sb.DETAIL_SPECS[key], "stock_momentum_v1",
+                                  "2026-08-09")
+        d = q.replace("%3A", ":").replace("%2C", ",")
+        check(f"{key}: bot_id=eq. filter present",
+              "bot_id=eq.stock_momentum_v1" in d, q)
+        check(f"{key}: since pushed server-side", "gte.2026-08-09" in d, q)
+        check(f"{key}: newest first", ".desc" in d, q)
+        check(f"{key}: row cap applied", f"limit={sb.DETAIL_ROWS}" in q, q)
+        check(f"{key}: URL-encoded", "%2C" in q, q)
+
+    # Open positions must NOT be windowed — ETF has held four since May.
+    qp = sb.build_detail_query(sb.DETAIL_SPECS["positions"], "etf_rotation_v1",
+                               "2026-08-09")
+    check("positions: bot_id filtered", "bot_id=eq.etf_rotation_v1" in qp, qp)
+    check("positions: NOT windowed (open positions predate --since)",
+          "gte" not in qp, qp)
+
+    q_all = sb.build_detail_query(sb.DETAIL_SPECS["runs"], "x", None)
+    check("--all sends no gte", "gte" not in q_all, q_all)
+    check("--all still filters by bot", "bot_id=eq.x" in q_all, q_all)
+
+    print("\n[12b] Run status notes")
+    runs = [
+        {"started_at": "2026-09-22T10:00:00+00:00", "ended_at": None,
+         "status": "running", "trade_count": 0, "error_count": 0},
+        {"started_at": "2026-09-21T10:00:00+00:00",
+         "ended_at": "2026-09-21T10:00:12+00:00", "status": "failed",
+         "trade_count": 0, "error_count": 3, "duration_ms": 12000},
+        {"started_at": "2026-09-20T10:00:00+00:00",
+         "ended_at": "2026-09-20T10:00:05+00:00", "status": "warning",
+         "trade_count": 1, "error_count": 1, "duration_ms": 5000},
+        {"started_at": "2026-09-19T10:00:00+00:00",
+         "ended_at": "2026-09-19T10:00:04+00:00", "status": "success",
+         "trade_count": 2, "error_count": 0, "duration_ms": 4000},
+    ]
+    out = sb.render_bot_detail("b", {"bot_type": "stock", "mode": "live"},
+                               {"health": "healthy"},
+                               {"runs": runs}, "2026-08-09")
+    check("running flagged as possibly orphaned", "ORPHANED" in out, "")
+    check("failed flagged", "FAILED" in out)
+    check("warning flagged as degraded", "degraded" in out)
+    check("success gets no scary note", out.count("FAILED") == 1)
+    check("duration rendered in seconds", "12.0" in out)
+
+    print("\n[12c] Open positions and unaudited marks")
+    pos = [
+        {"symbol": "SPY", "status": "open", "quantity": 0.1,
+         "entry_price": 500.0, "entry_at": "2026-05-21T14:00:00+00:00",
+         "amount_usd": 50.0, "is_paper": False,
+         "metadata": {"mark_pnl_usd": 3.21, "dry_run": False}},
+        {"symbol": "QQQ", "status": "open", "quantity": 0.1,
+         "entry_price": 400.0, "entry_at": "2026-05-21T14:00:00+00:00",
+         "amount_usd": 40.0, "is_paper": False, "metadata": {}},
+        {"symbol": "OLD", "status": "closed", "quantity": 1.0,
+         "entry_price": 10.0, "metadata": {}},
+    ]
+    out = sb.render_bot_detail("etf", None, None, {"positions": pos}, None)
+    check("mark_pnl_usd rendered", "3.21" in out, "")
+    check("closed positions excluded", "OLD" not in out)
+    check("open positions shown", "SPY" in out and "QQQ" in out)
+    check("mark labelled UNREALIZED", "UNREALIZED" in out)
+    check("mark labelled UNAUDITED", "UNAUDITED" in out)
+    check("explains it is not the pnl_usd column", "pnl_usd" in out)
+    check("blank mark explained", "never been marked" in out)
+    check("position age shown", "d" in out)
+
+    print("\n[12d] Live and paper are labelled, never totalled")
+    trades = [
+        {"occurred_at": "2026-09-20T10:00:00+00:00", "symbol": "AAPL",
+         "side": "SELL", "price": 230.0, "quantity": 0.1, "amount_usd": 23.0,
+         "pnl_usd": -1.25, "pnl_pct": -0.0325, "is_paper": False,
+         "strategy": "dynamic_sl"},
+        {"occurred_at": "2026-09-19T10:00:00+00:00", "symbol": "MSFT",
+         "side": "SELL", "price": 400.0, "quantity": None, "amount_usd": None,
+         "pnl_usd": 50.0, "pnl_pct": 0.10, "is_paper": True,
+         "strategy": "momentum_exit"},
+    ]
+    out = sb.render_bot_detail("b", None, None, {"trades": trades}, None)
+    check("live row labelled", "LIVE" in out)
+    check("paper row labelled", "PAPER" in out)
+    check("section states it does not total", "does NOT total" in out)
+    check("missing quantity renders as dash, not 0",
+          "0.00000000" not in out.split("MSFT")[1][:60],
+          "a NULL quantity must not print as zero")
+    check("pnl_pct rendered as percent", "-3.25%" in out or "3.25%" in out)
+
+    print("\n[12e] Unreadable vs empty are different statements")
+
+    # Assert against ONE SECTION, not the whole report. render_bot_detail
+    # always emits all five sections, so a fixture supplying only `runs`
+    # leaves the other four as dict.get() -> None, which correctly renders
+    # UNREADABLE. Searching the full string found that unrelated section
+    # and reported a failure in the one being tested.
+    def section_of(report: str, header_prefix: str) -> str:
+        lines = report.splitlines()
+        heads = ("RECENT RUNS", "RECENT TRADES", "OPEN POSITIONS",
+                 "RECENT ERRORS", "RECENT EVENTS", "=" * 10)
+        try:
+            start = next(i for i, ln in enumerate(lines)
+                         if ln.startswith(header_prefix))
+        except StopIteration:
+            return ""
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if any(lines[j].startswith(h) for h in heads):
+                end = j
+                break
+        return "\n".join(lines[start:end])
+
+    out = sb.render_bot_detail("b", None, None, {"runs": None}, None)
+    runs_sec = section_of(out, "RECENT RUNS")
+    check("section extractor found RECENT RUNS", bool(runs_sec))
+    check("None -> UNREADABLE", "UNREADABLE" in runs_sec, runs_sec)
+    check("None warns absence is not evidence", "NOT evidence" in runs_sec)
+
+    out = sb.render_bot_detail("b", None, None, {"runs": []}, None)
+    runs_sec = section_of(out, "RECENT RUNS")
+    check("[] -> (none in this window)",
+          "(none in this window)" in runs_sec, runs_sec)
+    check("[] does NOT say unreadable", "UNREADABLE" not in runs_sec, runs_sec)
+    check("[] does not warn about evidence", "NOT evidence" not in runs_sec)
+
+    # The realistic case, and a stronger assertion than the original: every
+    # section fetched successfully and every one empty. Nothing anywhere in
+    # the report may claim a read failure.
+    all_empty = sb.render_bot_detail(
+        "b", None, None, {k: [] for k in sb.DETAIL_SPECS}, None)
+    check("all sections empty -> no UNREADABLE anywhere",
+          "UNREADABLE" not in all_empty)
+    check("all sections empty -> each says (none)",
+          all_empty.count("(none in this window)") >= 4,
+          f"got {all_empty.count('(none in this window)')}")
+
+    # And the inverse: every section failing must say so every time.
+    all_none = sb.render_bot_detail(
+        "b", None, None, {k: None for k in sb.DETAIL_SPECS}, None)
+    check("all sections unreadable -> UNREADABLE in each",
+          all_none.count("UNREADABLE") >= 4,
+          f"got {all_none.count('UNREADABLE')}")
+    check("all sections unreadable -> never says (none)",
+          "(none in this window)" not in all_none)
+
+    print("\n[12f] Header and unknown bots")
+    out = sb.render_bot_detail(
+        "stock_momentum_v1",
+        {"bot_type": "stock", "mode": "live", "status": "enabled",
+         "can_place_orders": True, "max_order_usd": 15},
+        {"health": "healthy", "last_heartbeat_at": "2026-09-22T07:37:07+00:00",
+         "last_run_status": "success", "last_run_id": "abc-123"},
+        {}, "2026-08-09")
+    check("bot_id in header", "stock_momentum_v1" in out)
+    check("type shown", "stock" in out)
+    check("mode shown", "live" in out)
+    check("can_place_orders shown", "can_place_orders=True" in out)
+    check("heartbeat shown", "2026-09-22T07:37:07" in out)
+    check("last run id shown", "abc-123" in out)
+    check("window shown", "since 2026-08-09" in out)
+
+    unknown = sb.render_bot_detail("nope", None, None, {}, None)
+    check("unknown bot says so", "not found in bot_registry" in unknown)
+    check("unknown bot does not crash", isinstance(unknown, str))
+
+    print("\n[12g] Overview mode is unaffected")
+    data = {k: [] for k in sb.TABLE_SPECS}
+    ov = sb.build_report(data, "2026-08-09")
+    check("overview still renders", "LEAGUE SCOREBOARD" in ov)
+    check("overview is not the detail view", "BOT DETAIL" not in ov)
+    check("detail is not the overview",
+          "LEAGUE SCOREBOARD" not in sb.render_bot_detail("b", None, None, {}, None))
+
+
 def test_read_only() -> None:
     print("\n[8] Read-only by construction")
     path = pathlib.Path(sb.__file__)
@@ -606,6 +782,7 @@ def main() -> int:
     test_query_direction_and_encoding()
     test_pagination()
     test_freshness_footer()
+    test_bot_detail()
     test_read_only()
     print("\n" + "=" * 70)
     print(f"  {_PASS} passed, {_FAIL} failed")
