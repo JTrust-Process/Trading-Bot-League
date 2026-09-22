@@ -35,6 +35,45 @@ class Monitor:
         return self._client
 
     def start_run(self):
+        # ── PER-RUN COUNTER RESET ──────────────────────────────────────────
+        #
+        # FIXED 2026-09-22. These three lines were missing, and their absence
+        # was invisible until someone compared reported counts against the
+        # rows they were supposedly counting.
+        #
+        # `monitor` is a MODULE-LEVEL SINGLETON (bottom of this file). Under
+        # GitHub Actions each cycle was its own process, so a fresh Monitor
+        # was constructed every run and __init__ did the resetting. On Fly
+        # the agent_runner is ONE long-lived process: `import monitor`
+        # resolves from sys.modules, so the same instance survives for
+        # weeks. main.py re-executes bot.py via runpy each cycle, which
+        # creates a fresh module namespace but NOT a fresh Monitor.
+        #
+        # start_run() reset run_id and start_time but not the counters, so
+        # error_count and trade_count accumulated monotonically from
+        # process start. Supabase showed stock_momentum_v1 reporting
+        # error_count 37, 39, 41 ... 63 across consecutive runs while the
+        # joined bot_errors rows for each of those runs numbered ZERO.
+        #
+        # Two consequences, both silent:
+        #   1. end_run() promotes any run with error_count > 0 to "warning",
+        #      so every cycle after the first error was permanently degraded
+        #      — and league_health reads last_run_status.
+        #   2. critical_error is sticky, so ONE critical error pinned every
+        #      subsequent run to "failed" until the machine restarted.
+        #
+        # This is the same class of post-migration regression as the
+        # GITHUB_REF_NAME state-key fallback and the APScheduler day-of-week
+        # off-by-one: code whose correctness depended on an assumption
+        # ("each run is a fresh process") that the move to Fly quietly broke.
+        # Nothing errored; a surface just reported something untrue.
+        #
+        # Reset BEFORE the bot_runs insert so the new row and the in-memory
+        # counters agree from the first instant of the run.
+        self.error_count = 0
+        self.trade_count = 0
+        self.critical_error = False
+
         self.run_id = str(uuid.uuid4())
         self.start_time = datetime.now(timezone.utc)
         try:

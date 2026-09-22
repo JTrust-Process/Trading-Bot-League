@@ -204,6 +204,16 @@ jobs:
           SMOKE_STRICT: "1"
         run: python -m league_core._payload_contract_smoke
 
+      # Monitor counters must be PER-RUN. The agent_runner is one
+      # long-lived process, so a module-level singleton survives for weeks;
+      # counters that only reset in __init__ accumulate across every cycle
+      # and mark healthy runs as "warning" (or, for a sticky
+      # critical_error, "failed") forever.
+      - name: Smoke — monitor per-run counter reset
+        env:
+          SMOKE_STRICT: "1"
+        run: python -m bots.stock_momentum_v1._monitor_smoke
+
       # Cheap structural guards. Each encodes a rule that a reviewer would
       # otherwise have to remember, and each maps to a real incident.
       - name: Guard — analytics must not import trading code
