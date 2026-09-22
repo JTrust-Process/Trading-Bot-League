@@ -372,6 +372,226 @@ def test_read_only() -> None:
           len(bearer_lines) == 1, f"{[l.strip() for l in bearer_lines]}")
 
 
+def test_query_direction_and_encoding() -> None:
+    """The v1 bug: asc+limit fetched the OLDEST rows and dropped the present.
+
+    Confirmed in production 2026-09-22 — bot_runs held 9,726 rows with the
+    newest at 2026-09-22T07:37Z, while the scoreboard reported 0 runs since
+    2026-08-09. The fetch had taken the oldest 5,000.
+
+    Ordering direction is therefore load-bearing, not stylistic, and these
+    assertions exist to keep it that way.
+    """
+    print("\n[9] Query ordering — newest first, never oldest")
+
+    for key, ts in (("runs", "started_at"), ("trades", "occurred_at"),
+                    ("errors", "occurred_at")):
+        spec = sb.TABLE_SPECS[key]
+        q = sb.build_query(spec, since="2026-08-09")
+        check(f"{key}: orders {ts}.desc",
+              f"order={ts}.desc" in q.replace("%2C", ",").replace("%3A", ":"),
+              q)
+        check(f"{key}: NOT ascending", f"{ts}.asc" not in q, q)
+        check(f"{key}: has a page limit", "limit=" in q, q)
+        check(f"{key}: page size <= 1000",
+              f"limit={sb.PAGE_SIZE}" in q and sb.PAGE_SIZE <= 1000, q)
+
+    print("\n[9b] The --since window is pushed SERVER-SIDE")
+    for key, ts in (("runs", "started_at"), ("trades", "occurred_at"),
+                    ("errors", "occurred_at")):
+        q = sb.build_query(sb.TABLE_SPECS[key], since="2026-08-09")
+        decoded = q.replace("%3A", ":").replace("%2B", "+")
+        check(f"{key}: includes {ts}=gte.2026-08-09",
+              f"{ts}=gte.2026-08-09" in decoded, q)
+        # Without a window, no filter — otherwise --all would lie.
+        q_all = sb.build_query(sb.TABLE_SPECS[key], since=None)
+        check(f"{key}: --all sends no gte filter", "gte" not in q_all, q_all)
+
+    print("\n[9c] Tables deliberately NOT windowed server-side")
+    # An open position may predate the window and still be open now.
+    q = sb.build_query(sb.TABLE_SPECS["positions"], since="2026-08-09")
+    check("positions: no gte filter (open positions predate the window)",
+          "gte" not in q, q)
+    check("status: no gte filter (always want current status)",
+          "gte" not in sb.build_query(sb.TABLE_SPECS["status"], "2026-08-09"))
+
+    print("\n[9d] Parameters are URL-ENCODED, not concatenated")
+    # A raw '+' in a query string decodes to a SPACE server-side, which is
+    # how an ISO offset silently becomes a different (or invalid) instant.
+    iso = "2026-09-20T10:30:00+00:00"
+    q = sb.build_query(sb.TABLE_SPECS["runs"], since=iso)
+    check("'+' is escaped to %2B", "%2B" in q, q)
+    check("no raw '+' survives in the query", "+00:00" not in q, q)
+    check("':' is escaped to %3A", "%3A" in q, q)
+    check("select commas escaped", "%2C" in q or "," not in q.split("select=")[1][:60])
+
+    src = pathlib.Path(sb.__file__).read_text(encoding="utf-8")
+    check("uses urlencode", "urlencode(" in src)
+    check("no f-string builds a gte filter directly",
+          'f"&started_at=gte.' not in src and "f'&started_at=gte." not in src)
+
+
+def test_pagination() -> None:
+    """The server caps below the client limit — paging is the only fix.
+
+    Production symptom: limit=5000 returned exactly 1000 (PostgREST's
+    max-rows), the script compared 1000 against its own 5000 and concluded
+    "complete", and every bot's first-seen date became an artifact of where
+    those 1000 rows ran out.
+    """
+    print("\n[11] Pagination")
+    spec = sb.TABLE_SPECS["runs"]
+
+    print("\n[11a] build_query carries offset")
+    q0 = sb.build_query(spec, "2026-08-09", offset=0, page_size=1000)
+    q1 = sb.build_query(spec, "2026-08-09", offset=1000, page_size=1000)
+    check("page 1 has offset=0", "offset=0" in q0, q0)
+    check("page 2 has offset=1000", "offset=1000" in q1, q1)
+    check("page size honoured", "limit=1000" in q0, q0)
+    check("gte survives paging", "gte.2026-08-09" in q1.replace("%3A", ":"), q1)
+    check("order survives paging", "order=started_at.desc" in q1, q1)
+    check("still URL-encoded", "%2C" in q1, q1)
+
+    def pager(pages: list[list[dict]]):
+        """Fake getter returning canned pages; records every URL."""
+        seen: list[str] = []
+
+        def _g(cfg, path):
+            seen.append(path)
+            i = len(seen) - 1
+            return pages[i] if i < len(pages) else []
+        return _g, seen
+
+    page = [{"started_at": "2026-09-01T00:00:00+00:00"}] * 1000
+    short = [{"started_at": "2026-08-20T00:00:00+00:00"}] * 137
+
+    print("\n[11b] Multiple pages combine")
+    g, seen = pager([page, page, short])
+    rows, m = sb.fetch_paginated({}, spec, "2026-08-09", page_size=1000, getter=g)
+    check("all pages combined", len(rows) == 2137, f"got {len(rows)}")
+    check("three requests made", len(seen) == 3, f"made {len(seen)}")
+    check("pages counted", m["pages"] == 3, f"got {m['pages']}")
+    check("NOT truncated — ended naturally", m["truncated"] is False)
+    check("offsets advanced 0/1000/2000",
+          "offset=0" in seen[0] and "offset=1000" in seen[1]
+          and "offset=2000" in seen[2], f"{seen}")
+
+    print("\n[11c] A full page ALWAYS triggers another request")
+    g, seen = pager([page, []])
+    rows, m = sb.fetch_paginated({}, spec, None, page_size=1000, getter=g)
+    check("exactly 1000 rows -> second page requested", len(seen) == 2,
+          "a full page is indistinguishable from a server cap until you ask")
+    check("second page empty -> stop", len(rows) == 1000)
+    check("not truncated once confirmed", m["truncated"] is False)
+
+    print("\n[11d] Stops on a short page")
+    g, seen = pager([short])
+    rows, m = sb.fetch_paginated({}, spec, None, page_size=1000, getter=g)
+    check("one request only", len(seen) == 1)
+    check("short page ends the scan", len(rows) == 137)
+    check("not truncated", m["truncated"] is False)
+
+    print("\n[11e] Guards")
+    g, seen = pager([page] * 50)
+    rows, m = sb.fetch_paginated({}, spec, None, page_size=1000,
+                                 max_pages=3, getter=g)
+    check("max_pages caps the loop", len(seen) == 3, f"made {len(seen)}")
+    check("guard sets TRUNCATED", m["truncated"] is True)
+    check("rows returned up to the guard", len(rows) == 3000)
+
+    print("\n[11f] Failure handling")
+    def fail_first(cfg, path):
+        return None
+    rows, m = sb.fetch_paginated({}, spec, None, getter=fail_first)
+    check("first page fails -> None, unreadable",
+          rows is None and m["unreadable"] is True)
+    check("unreadable is not 'truncated'", m["truncated"] is False)
+
+    calls = {"n": 0}
+    def fail_second(cfg, path):
+        calls["n"] += 1
+        return page if calls["n"] == 1 else None
+    rows, m = sb.fetch_paginated({}, spec, None, page_size=1000,
+                                 getter=fail_second)
+    check("mid-scan failure keeps earlier pages", len(rows) == 1000)
+    check("mid-scan failure marks PARTIAL", m["partial"] is True)
+    check("partial also marks truncated (never 'complete')",
+          m["truncated"] is True)
+
+
+def test_freshness_footer() -> None:
+    print("\n[10] DATA FRESHNESS footer")
+    rows = [{"started_at": f"2026-09-{d:02d}T10:00:00+00:00"} for d in range(1, 11)]
+
+    m = sb.table_freshness(rows, "started_at", {"pages": 1, "truncated": False})
+    check("counts rows", m["rows"] == 10)
+    check("latest is the max, not the first", m["latest"].startswith("2026-09-10"),
+          f"got {m['latest']}")
+    check("not truncated when paging ended naturally", m["truncated"] is False)
+    check("page count carried", m["pages"] == 1)
+
+    # THE regression: a row count equal to a cap is NOT truncation on its
+    # own. Only the pagination outcome decides.
+    thousand = [{"started_at": "2026-09-01T00:00:00+00:00"}] * 1000
+    m = sb.table_freshness(thousand, "started_at",
+                           {"pages": 2, "truncated": False})
+    check("exactly 1000 rows is COMPLETE when paging confirmed it",
+          m["truncated"] is False,
+          "the old check inferred truncation from the row count alone")
+    m = sb.table_freshness(thousand, "started_at",
+                           {"pages": 30, "truncated": True})
+    check("1000 rows IS truncated when the guard fired", m["truncated"] is True)
+
+    m = sb.table_freshness(None, "started_at", {"unreadable": True})
+    check("None -> unreadable, not empty", m["unreadable"] is True)
+    check("unreadable has no row count", m["rows"] is None)
+
+    m = sb.table_freshness([], "started_at", {"pages": 1, "truncated": False})
+    check("empty list is readable, 0 rows",
+          m["unreadable"] is False and m["rows"] == 0)
+    check("empty list -> no latest", m["latest"] is None)
+    check("empty list not truncated", m["truncated"] is False)
+
+    m = sb.table_freshness([{"x": 1}], None, {"pages": 1})
+    check("no ts key -> latest None, no crash", m["latest"] is None)
+
+    out = "\n".join(sb.render_freshness({
+        "runs": {"table": "bot_runs", "rows": 3000, "pages": 3,
+                 "latest": "2026-09-22T14:17:00+00:00", "truncated": True,
+                 "partial": False, "unreadable": False},
+        "trades": {"table": "bot_trades", "rows": 38, "pages": 1,
+                   "latest": "2026-09-19T18:02:00+00:00", "truncated": False,
+                   "partial": False, "unreadable": False},
+        "errors": {"table": "bot_errors", "rows": None, "latest": None,
+                   "truncated": False, "partial": False, "unreadable": True},
+    }))
+    check("footer header present", "DATA FRESHNESS" in out)
+    check("TRUNCATED marker shown", "TRUNCATED" in out, out)
+    check("page count shown", "3pg" in out, out)
+    check("guard is explained", "guard" in out.lower(), out)
+    check("truncation explains what is missing", "OLDEST" in out, out)
+    check("unreadable table named as such", "UNREADABLE" in out, out)
+    check("unreadable warns figures exclude it", "EXCLUDE" in out, out)
+    check("non-truncated table has no marker",
+          "bot_trades" in out and "38 rows" in out)
+
+    partial = "\n".join(sb.render_freshness({
+        "runs": {"table": "bot_runs", "rows": 1000, "pages": 1, "latest": None,
+                 "truncated": True, "partial": True, "unreadable": False},
+    }))
+    check("PARTIAL shown when a page failed", "PARTIAL" in partial, partial)
+
+    # And the footer reaches the report.
+    data = {k: [] for k in sb.TABLE_SPECS}
+    meta = {"runs": {"table": "bot_runs", "rows": 3000, "pages": 3,
+                     "latest": None, "truncated": True, "partial": False,
+                     "unreadable": False}}
+    rep = sb.build_report(data, "2026-08-09", meta)
+    check("build_report includes the footer", "DATA FRESHNESS" in rep)
+    check("build_report still works without meta",
+          "DATA FRESHNESS" not in sb.build_report(data, "2026-08-09"))
+
+
 def main() -> int:
     print("=" * 70)
     print("league_scoreboard — pure helpers (no network, no credentials)")
@@ -383,6 +603,9 @@ def main() -> int:
     test_expenses()
     test_notes()
     test_report_is_pure()
+    test_query_direction_and_encoding()
+    test_pagination()
+    test_freshness_footer()
     test_read_only()
     print("\n" + "=" * 70)
     print(f"  {_PASS} passed, {_FAIL} failed")

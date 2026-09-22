@@ -60,6 +60,7 @@ import os
 import sys
 from datetime import date, datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 try:
     import requests
@@ -108,8 +109,222 @@ KNOWN_GAPS: dict[str, tuple[str, ...]] = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  QUERY SPECS — one source of truth for what is fetched and how.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ⚠ ORDER DIRECTION IS LOAD-BEARING. Every ordered fetch MUST be `.desc`.
+#
+# v1 used `order=started_at.asc&limit=5000`, which returns the 5,000
+# OLDEST rows. Crypto alone writes ~96 runs/day (every 15 min, 24/7), so
+# the cap was reached roughly six weeks in and every newer run was
+# discarded BEFORE the --since window was applied. The scoreboard then
+# reported 0 recent runs while bot_status and bot_positions — small tables
+# nowhere near any limit — looked perfectly current.
+#
+# With `.desc`, a limit truncates the OLDEST rows instead: you lose
+# history you were not asking for, never the present.
+#
+# This is the same defect flagged in the 2026-09 Public API audit
+# (Polygon called with `sort=asc&limit=200` over a ~205-day range, silently
+# dropping the newest bars). Writing it into this script three weeks later
+# is why the DATA FRESHNESS footer below now exists: a TRUNCATED marker
+# makes the failure self-diagnosing instead of invisible.
+
+# ── Pagination ──────────────────────────────────────────────────────────────
+#
+# PostgREST enforces its OWN row cap (Supabase defaults to 1000) regardless
+# of the `limit` a client asks for. The first version of this script sent
+# limit=5000, got exactly 1000 back, and reported that as complete — its
+# truncation check compared the result against the CLIENT limit and never
+# saw the server's.
+#
+# The symptom in production: every bot's "first run" showed as 2026-09-12
+# or later even though the window opened 2026-08-09, because that is simply
+# where the newest 1000 rows ran out. Run counts, first-seen dates and
+# error totals were all understated, and nothing in the output said so.
+#
+# So: page through with offsets until a page comes back short. Truncation
+# now means "the SAFETY GUARD stopped us", never "we hit some cap and
+# assumed that was everything".
+
+PAGE_SIZE = 1000          # must be <= PostgREST's max-rows
+MAX_PAGES = 30            # guard: a broken query must not loop forever
+MAX_ROWS = PAGE_SIZE * MAX_PAGES
+
+
+TABLE_SPECS: dict[str, dict[str, Any]] = {
+    # NOTE: every spec carries an `order`. Offset pagination without a
+    # stable sort is non-deterministic — rows can repeat or vanish between
+    # pages — so even tables that do not need sorting for display get one.
+    "registry": {
+        "table": "bot_registry", "select": "*",
+        "ts": None, "order": "bot_id.asc", "since_key": None,
+    },
+    "status": {
+        "table": "bot_status", "select": "*",
+        "ts": "last_heartbeat_at", "order": "last_heartbeat_at.desc",
+        "since_key": None,   # always want current status, unwindowed
+    },
+    "runs": {
+        "table": "bot_runs",
+        "select": "bot_id,started_at,status,trade_count,error_count",
+        "ts": "started_at", "order": "started_at.desc",
+        "since_key": "started_at",
+    },
+    "trades": {
+        "table": "bot_trades",
+        "select": "bot_id,occurred_at,side,pnl_usd,is_paper,strategy,symbol",
+        "ts": "occurred_at", "order": "occurred_at.desc",
+        "since_key": "occurred_at",
+    },
+    "positions": {
+        "table": "bot_positions",
+        "select": "bot_id,status,symbol,updated_at",
+        "ts": "updated_at", "order": "updated_at.desc",
+        # No since_key: an OPEN position may have been entered long before
+        # the window and is still open now. Filtering it out server-side
+        # would undercount current exposure.
+        "since_key": None,
+    },
+    "errors": {
+        "table": "bot_errors", "select": "bot_id,occurred_at",
+        "ts": "occurred_at", "order": "occurred_at.desc",
+        "since_key": "occurred_at",
+    },
+    "expenses": {
+        "table": "bot_expenses",
+        # created_at is selected purely so DATA FRESHNESS can report a
+        # latest timestamp. Without it the footer always showed "—",
+        # which reads as "no data" rather than "column not fetched".
+        "select": "bot_id,amount_usd,period,category,recurring,created_at",
+        # Windowed client-side by `period` (YYYY-MM), not by a timestamp.
+        "ts": "created_at", "order": "period.desc", "since_key": None,
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  PURE HELPERS — no IO, no network. Unit-tested.
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def build_query(spec: dict[str, Any], since: Optional[str] = None, *,
+                offset: int = 0, page_size: int = PAGE_SIZE) -> str:
+    """Build one PostgREST path. Pure — no IO. URL-ENCODED.
+
+    Encoding is not cosmetic. A raw `+` in a query string decodes to a
+    SPACE, so interpolating an ISO timestamp like
+    '2026-09-20T10:30:00+00:00' directly produces
+    'lt.2026-09-20T10:30:00 00:00' server-side — a parse error or, worse,
+    a silently different instant. urlencode escapes `+` and `:` correctly.
+
+    Pushing the window into the query (rather than filtering after) is what
+    makes the row limit safe: the cap then applies to the window you asked
+    for instead of to all history.
+    """
+    params: list[tuple[str, str]] = [("select", spec["select"])]
+    since_key = spec.get("since_key")
+    if since_key and since:
+        params.append((since_key, f"gte.{since}"))
+    if spec.get("order"):
+        params.append(("order", spec["order"]))
+    params.append(("limit", str(page_size)))
+    params.append(("offset", str(int(offset))))
+    return f"{spec['table']}?{urlencode(params)}"
+
+
+def table_freshness(
+    rows: Optional[list[dict[str, Any]]],
+    ts_key: Optional[str],
+    page_meta: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Row count, newest timestamp, and pagination outcome.
+
+    `truncated` comes from PAGINATION, not from comparing the row count to
+    a limit. That distinction is the whole fix: the previous version
+    inferred completeness from "fewer rows than I asked for", which is
+    false whenever the SERVER caps below the client's limit. Exactly 1000
+    rows is now only ever considered complete if a further page was
+    requested and came back short.
+    """
+    if rows is None:
+        return {"rows": None, "latest": None, "truncated": False,
+                "pages": 0, "unreadable": True, "partial": False}
+    latest: Optional[str] = None
+    if ts_key:
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            v = r.get(ts_key)
+            if isinstance(v, str) and v and (latest is None or v > latest):
+                latest = v
+    pm = page_meta or {}
+    return {
+        "rows": len(rows),
+        "latest": latest,
+        "pages": pm.get("pages", 1),
+        # True ONLY when the safety guard stopped us, or a page failed
+        # mid-scan. Never "we hit a cap and assumed that was everything".
+        "truncated": bool(pm.get("truncated")),
+        "partial": bool(pm.get("partial")),
+        "unreadable": False,
+    }
+
+
+def fetch_paginated(
+    cfg: dict[str, str],
+    spec: dict[str, Any],
+    since: Optional[str] = None,
+    *,
+    page_size: int = PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+    getter: Any = None,
+) -> tuple[Optional[list[dict[str, Any]]], dict[str, Any]]:
+    """Page through one table with GET requests. Returns (rows, page_meta).
+
+    Stops when a page returns FEWER rows than page_size — the only reliable
+    signal that the end was reached. A page returning exactly page_size
+    always triggers another request, because that is indistinguishable from
+    a server-side cap until you ask again.
+
+    `getter` is injected so the pagination logic can be unit-tested with no
+    network. It defaults to the real GET.
+
+    Guards: max_pages bounds the loop, and a mid-scan failure stops cleanly
+    and is reported as `partial` rather than silently returning a short
+    list that would read as complete.
+    """
+    fetch = getter or _get
+    rows: list[dict[str, Any]] = []
+    pages = 0
+    truncated = False
+    partial = False
+
+    while True:
+        if pages >= max_pages:
+            truncated = True
+            break
+        page = fetch(cfg, build_query(spec, since,
+                                      offset=len(rows), page_size=page_size))
+        if page is None:
+            if pages == 0:
+                return None, {"pages": 0, "truncated": False,
+                              "partial": False, "unreadable": True}
+            # Some pages already succeeded: keep them, but never present
+            # the result as complete.
+            partial = True
+            truncated = True
+            break
+        pages += 1
+        rows.extend(page)
+        if len(page) < page_size:
+            break          # short page == genuinely the end
+        if len(rows) >= MAX_ROWS:
+            truncated = True
+            break
+
+    return rows, {"pages": pages, "truncated": truncated, "partial": partial,
+                  "unreadable": False}
 
 
 def parse_since(value: Optional[str], *, all_time: bool = False) -> Optional[str]:
@@ -412,20 +627,24 @@ def _get(cfg: dict[str, str], path: str, timeout: float = 20.0) -> Optional[list
     return rows if isinstance(rows, list) else None
 
 
-def fetch_all(cfg: dict[str, str]) -> dict[str, Optional[list[dict]]]:
-    """Every table this report reads. A missing table degrades to None."""
-    return {
-        "registry":  _get(cfg, "bot_registry?select=*"),
-        "status":    _get(cfg, "bot_status?select=*"),
-        "runs":      _get(cfg, "bot_runs?select=bot_id,started_at,status,"
-                               "trade_count,error_count&order=started_at.asc&limit=5000"),
-        "trades":    _get(cfg, "bot_trades?select=bot_id,occurred_at,side,pnl_usd,"
-                               "is_paper,strategy,symbol&order=occurred_at.asc&limit=5000"),
-        "positions": _get(cfg, "bot_positions?select=bot_id,status,symbol,updated_at"),
-        "errors":    _get(cfg, "bot_errors?select=bot_id,occurred_at&limit=5000"),
-        "expenses":  _get(cfg, "bot_expenses?select=bot_id,amount_usd,period,"
-                               "category,recurring"),
-    }
+def fetch_all(
+    cfg: dict[str, str], since: Optional[str] = None,
+) -> tuple[dict[str, Optional[list[dict]]], dict[str, dict[str, Any]]]:
+    """Fetch every table. Returns (rows_by_key, freshness_by_key).
+
+    Queries are built from TABLE_SPECS, newest-first, with the window
+    pushed server-side where it applies. A missing or unreadable table
+    degrades to None and is reported as such rather than as "empty" —
+    those are different facts and only one of them means "no activity".
+    """
+    data: dict[str, Optional[list[dict]]] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for key, spec in TABLE_SPECS.items():
+        rows, page_meta = fetch_paginated(cfg, spec, since)
+        data[key] = rows
+        meta[key] = table_freshness(rows, spec.get("ts"), page_meta)
+        meta[key]["table"] = spec["table"]
+    return data, meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -433,7 +652,54 @@ def fetch_all(cfg: dict[str, str]) -> dict[str, Optional[list[dict]]]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str]) -> str:
+def render_freshness(meta: dict[str, dict[str, Any]]) -> list[str]:
+    """The DATA FRESHNESS block.
+
+    This exists because of a real incident: the scoreboard reported 0 runs
+    since 2026-08-09 while the League project held 9,726 runs with the
+    newest at 2026-09-22. The query had fetched the oldest 5,000. Nothing
+    in the output hinted at it — the table simply looked empty, which is
+    indistinguishable from "the bots did not run".
+
+    A TRUNCATED marker makes that self-diagnosing. Same principle as the
+    NOTES section: how much to trust a number must be as visible as the
+    number.
+    """
+    if not meta:
+        return []
+    out = ["", "DATA FRESHNESS", "-" * 100]
+    for key in TABLE_SPECS:
+        m = meta.get(key)
+        if not m:
+            continue
+        name = m.get("table", key)
+        if m.get("unreadable"):
+            out.append(f"  {name:<18}{'UNREADABLE':>10}   "
+                       f"could not be fetched — figures above EXCLUDE this table")
+            continue
+        n = m.get("rows") or 0
+        latest = m.get("latest")
+        pages = m.get("pages", 1)
+        line = (f"  {name:<18}{n:>6} rows  {pages:>3}pg   "
+                f"latest {(latest[:19] + 'Z') if latest else '—'}")
+        if m.get("partial"):
+            line += "   ⚠ PARTIAL — a page failed mid-scan"
+        elif m.get("truncated"):
+            line += "   ⚠ TRUNCATED — safety guard stopped paging"
+        out.append(line)
+    if any(m.get("truncated") or m.get("partial") for m in meta.values()):
+        out.append("")
+        out.append(f"  Paging stops when a page returns fewer than {PAGE_SIZE} "
+                   f"rows. TRUNCATED means the")
+        out.append(f"  {MAX_PAGES}-page / {MAX_ROWS}-row guard stopped us "
+                   f"first; PARTIAL means a page failed.")
+        out.append("  Rows are NEWEST-FIRST, so anything missing is the "
+                   "OLDEST history. Narrow --since.")
+    return out
+
+
+def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str],
+                 meta: Optional[dict[str, dict[str, Any]]] = None) -> str:
     """Assemble the whole report. Pure given `data` — no IO."""
     all_time = since is None
     registry = data.get("registry") or []
@@ -469,7 +735,7 @@ def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str]) ->
     L.append("")
     L.append("ACTIVITY")
     L.append("-" * 100)
-    L.append(f"{'bot_id':<22}{'type':<10}{'mode':<8}{'runs':>6}"
+    L.append(f"{'bot_id':<22}{'type':<17}{'mode':<10}{'runs':>6}"
              f"  {'first':<11}{'last':<11}{'status':<10}{'err(rep)':>9}{'err(rows)':>10}")
     L.append("-" * 100)
     for bot in bots:
@@ -477,8 +743,8 @@ def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str]) ->
         r = runs.get(bot, {})
         st = status_by.get(bot, {})
         L.append(
-            f"{bot:<22}{str(reg.get('bot_type') or '—'):<10}"
-            f"{str(reg.get('mode') or '—'):<8}{r.get('runs', 0):>6}"
+            f"{bot:<22}{str(reg.get('bot_type') or '—'):<17}"
+            f"{str(reg.get('mode') or '—'):<10}{r.get('runs', 0):>6}"
             f"  {fmt_date(r.get('first')):<11}{fmt_date(r.get('last')):<11}"
             f"{str(r.get('last_status') or st.get('last_run_status') or '—'):<10}"
             f"{r.get('reported_errors', 0):>9}"
@@ -546,6 +812,8 @@ def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str]) ->
     if not any_notes:
         L.append("  (none)")
 
+    L.extend(render_freshness(meta or {}))
+
     L.append("")
     L.append("=" * 100)
     L.append("  v1 OMITS: unrealized P/L, SPY/QQQ benchmarks, time-weighted return,")
@@ -576,14 +844,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("[scoreboard] This script is read-only and needs only those two.")
         return 2
 
-    data = fetch_all(cfg)
+    data, meta = fetch_all(cfg, since)
     if data.get("registry") is None and data.get("runs") is None:
         print("[scoreboard] could not read bot_registry or bot_runs — "
               "reporting nothing rather than an empty scoreboard that looks "
               "like 'no activity'.")
         return 1
 
-    print(build_report(data, since))
+    print(build_report(data, since, meta))
     return 0
 
 
