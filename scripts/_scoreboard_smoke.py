@@ -25,6 +25,7 @@ import ast
 import os
 import pathlib
 import sys
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -299,6 +300,39 @@ def test_report_is_pure() -> None:
     check("error inflation surfaced (41 reported vs 0 rows)",
           "EXCEED" in out, "monitor inflation should be visible")
 
+    stock_perf = next(line for line in out.splitlines()
+                      if line.startswith("stock_momentum_v1") and "|" in line)
+    check("stock overview does not imply a measured position count",
+          stock_perf.split("|")[-1][:6].strip() == "N/A", stock_perf)
+    check("stock overview explains unverified holdings", "UNVERIFIED" in out)
+
+    current = {
+        "registry": [{"bot_id": "etf_rotation_v1", "mode": "paper"}],
+        "positions": [{"bot_id": "etf_rotation_v1", "symbol": "SPY",
+                       "status": "open", "updated_at": "2026-05-01T00:00:00Z"}],
+        "runs": [], "trades": [], "errors": [], "expenses": [], "status": [],
+    }
+    old_open = sb.build_report(current, "2026-08-09")
+    etf_perf = next(line for line in old_open.splitlines()
+                    if line.startswith("etf_rotation_v1") and "|" in line)
+    check("overview counts open positions older than --since",
+          etf_perf.split("|")[-1][:6].strip() == "1", etf_perf)
+    recent = dict(current, positions=[dict(current["positions"][0],
+                                           updated_at="2026-09-01T00:00:00Z")])
+    check("position age changes no other overview behavior",
+          old_open == sb.build_report(recent, "2026-08-09"))
+    closed = dict(current, positions=[dict(current["positions"][0], status="closed")])
+    check("closed positions still do not count",
+          sb.build_report(closed, "2026-08-09") ==
+          sb.build_report(dict(current, positions=[]), "2026-08-09"))
+    historical = dict(current,
+                      runs=[{"bot_id": "etf_rotation_v1", "status": "success",
+                             "started_at": "2026-05-01T00:00:00Z"}],
+                      trades=[dict(trade("etf_rotation_v1", 9.0),
+                                   occurred_at="2026-05-01T00:00:00Z")])
+    check("historical runs/trades still respect --since",
+          old_open == sb.build_report(historical, "2026-08-09"))
+
     # All-time must warn.
     out_all = sb.build_report(data, None)
     check("--all prints the pre-2026-08-09 warning",
@@ -344,6 +378,51 @@ def test_bot_detail() -> None:
     check("positions: bot_id filtered", "bot_id=eq.etf_rotation_v1" in qp, qp)
     check("positions: NOT windowed (open positions predate --since)",
           "gte" not in qp, qp)
+
+    parsed = parse_qs(urlsplit(qp).query)
+    check("positions: open status filtered SERVER-SIDE",
+          parsed.get("status") == ["eq.open"], qp)
+    check("positions: limit on the filtered server result",
+          parsed.get("limit") == [str(sb.DETAIL_ROWS)], qp)
+    encoded = sb.build_detail_query(sb.DETAIL_SPECS["positions"], "bot +&x")
+    check("positions: bot ID remains URL-encoded",
+          parse_qs(urlsplit(encoded).query)["bot_id"] == ["eq.bot +&x"]
+          and "%2B" in encoded and "%26" in encoded, encoded)
+
+    # Simulate server WHERE -> ORDER -> LIMIT over newer closed/other-bot
+    # rows and an older open row. Feed the actual generated query through
+    # fetch_bot_detail's injected getter; no network or credentials.
+    rows = ([{"bot_id": "etf_rotation_v1", "status": "closed",
+              "symbol": "CLOSED", "updated_at": "2026-09-20T00:00:00Z"}]
+            * (sb.DETAIL_ROWS + 1)
+            + [{"bot_id": "another_bot", "status": "open",
+                "symbol": "OTHER", "updated_at": "2026-09-21T00:00:00Z"}]
+            * (sb.DETAIL_ROWS + 1)
+            + [{"bot_id": "etf_rotation_v1", "status": "open",
+                "symbol": "SPY", "updated_at": "2026-05-01T00:00:00Z",
+                "entry_at": "2026-05-01T00:00:00Z"}])
+
+    def fake_getter(cfg, path):
+        table, _, query = path.partition("?")
+        if table != "bot_positions":
+            return []
+        params = parse_qs(query)
+        selected = rows
+        for key in ("bot_id", "status"):
+            if key in params:
+                expected = params[key][0].removeprefix("eq.")
+                selected = [r for r in selected if r[key] == expected]
+        selected = sorted(selected, key=lambda r: r["updated_at"], reverse=True)
+        return selected[:int(params["limit"][0])]
+
+    detail = sb.fetch_bot_detail({}, "etf_rotation_v1", "2026-08-09",
+                                 getter=fake_getter)
+    check("server filters open positions and bot BEFORE limit",
+          [r["symbol"] for r in detail["positions"]] == ["SPY"])
+    rendered = sb.render_bot_detail("etf_rotation_v1", {}, {}, detail, "2026-08-09")
+    check("old open position appears in windowed detail", "SPY" in rendered)
+    check("newer closed/other-bot positions cannot crowd out the open row",
+          "CLOSED" not in rendered and "OTHER" not in rendered)
 
     q_all = sb.build_detail_query(sb.DETAIL_SPECS["runs"], "x", None)
     check("--all sends no gte", "gte" not in q_all, q_all)
@@ -469,6 +548,109 @@ def test_bot_detail() -> None:
           f"got {all_none.count('UNREADABLE')}")
     check("all sections unreadable -> never says (none)",
           "(none in this window)" not in all_none)
+
+    for bot, rows, expected in (
+        ("stock_momentum_v1", [], "UNVERIFIED"),
+        ("stock_momentum_v1", None, "UNREADABLE"),
+        ("etf_rotation_v1", [], "(no open positions)"),
+        ("short_watchlist_v1", [], "(no open positions)"),
+    ):
+        report = sb.render_bot_detail(bot, {}, {}, {"positions": rows}, "2026-08-09")
+        section = section_of(report, "OPEN POSITIONS")
+        check(f"{bot} positions {rows!r}: {expected}", expected in section, section)
+        check(f"{bot} positions {rows!r}: no window-based empty message",
+              "none in this window" not in section)
+        if bot == "stock_momentum_v1":
+            check(f"stock positions {rows!r}: never claims no holdings",
+                  "no open positions" not in section, section)
+            other = "UNREADABLE" if rows == [] else "UNVERIFIED"
+            check(f"stock positions {rows!r}: distinct failure/coverage state",
+                  other not in section, section)
+            check(f"stock positions {rows!r}: no inferred symbols",
+                  "META" not in section and "GOOGL" not in section)
+
+    stock_rows = [{"symbol": "TEST", "status": "open"}]
+    section = section_of(sb.render_bot_detail(
+        "stock_momentum_v1", {}, {}, {"positions": stock_rows}, None), "OPEN POSITIONS")
+    check("stock nonempty League rows remain unverified", "UNVERIFIED" in section)
+
+    print("\n[12h] Positions query: open-only, server-side, unwindowed")
+    qp2 = sb.build_detail_query(sb.DETAIL_SPECS["positions"],
+                                "stock_momentum_v1", "2026-08-09")
+    d = qp2.replace("%3A", ":").replace("%2C", ",")
+    check("status=eq.open pushed server-side", "status=eq.open" in d, qp2)
+    check("bot_id pushed server-side", "bot_id=eq.stock_momentum_v1" in d, qp2)
+    check("no --since window on positions", "gte" not in d, qp2)
+    # Order matters: PostgREST applies filters BEFORE limit, so the cap
+    # counts OPEN rows only. Filtering after the fetch meant 20 rows of
+    # mostly-closed history could yield zero opens and render as
+    # "no open positions" — a limit artifact dressed up as a portfolio fact.
+    check("limit comes after the filters",
+          d.index("status=eq.open") < d.index("limit="), qp2)
+    check("URL-encoded", "%2C" in qp2, qp2)
+
+    print("\n[12i] Non-mirrored bots: UNVERIFIED, never 'no open positions'")
+    check("stock is registered as non-mirrored",
+          "stock_momentum_v1" in sb.POSITIONS_NOT_MIRRORED)
+    check("crypto is registered as non-mirrored",
+          "crypto_ema_atr_v1" in sb.POSITIONS_NOT_MIRRORED,
+          "crypto has the same gap as stock — positions live in "
+          "trader.positions and the crypto project's own bot_state")
+    check("etf is NOT in the non-mirrored set",
+          "etf_rotation_v1" not in sb.POSITIONS_NOT_MIRRORED)
+    check("short is NOT in the non-mirrored set",
+          "short_watchlist_v1" not in sb.POSITIONS_NOT_MIRRORED)
+
+    for bot in ("stock_momentum_v1", "crypto_ema_atr_v1"):
+        out = sb.render_bot_detail(bot, None, None, {"positions": []}, None)
+        sec = section_of(out, "OPEN POSITIONS")
+        check(f"{bot}: empty -> UNVERIFIED", "UNVERIFIED" in sec, sec)
+        check(f"{bot}: does NOT claim no open positions",
+              "(no open positions)" not in sec, sec)
+        check(f"{bot}: names the real source of truth",
+              "not mirrored" in sec or "own" in sec, sec)
+        # Must stay distinct from a failed fetch.
+        un = section_of(sb.render_bot_detail(bot, None, None,
+                                             {"positions": None}, None),
+                        "OPEN POSITIONS")
+        check(f"{bot}: unreadable -> UNREADABLE, not UNVERIFIED",
+              "UNREADABLE" in un and "UNVERIFIED" not in un, un)
+
+    print("\n[12j] Mirrored bots keep normal semantics")
+    for bot in ("etf_rotation_v1", "short_watchlist_v1", "bond_research_v1"):
+        sec = section_of(sb.render_bot_detail(bot, None, None,
+                                              {"positions": []}, None),
+                         "OPEN POSITIONS")
+        check(f"{bot}: empty -> (no open positions)",
+              "(no open positions)" in sec, sec)
+        check(f"{bot}: no UNVERIFIED warning", "UNVERIFIED" not in sec, sec)
+
+    print("\n[12k] Overview: open column and notes for non-mirrored bots")
+    data = {k: [] for k in sb.TABLE_SPECS}
+    data["registry"] = [{"bot_id": b, "bot_type": "x", "mode": "live"}
+                        for b in ("stock_momentum_v1", "crypto_ema_atr_v1",
+                                  "etf_rotation_v1")]
+    # An OPEN position whose updated_at predates --since must still count.
+    data["positions"] = [{"bot_id": "etf_rotation_v1", "status": "open",
+                          "symbol": "SPY",
+                          "updated_at": "2026-05-21T14:00:00+00:00"}]
+    ov = sb.build_report(data, "2026-08-09")
+    rows = {ln.split("|")[0].strip(): ln for ln in ov.splitlines()
+            if "|" in ln and "bot_id" not in ln}
+    check("stock open column reads N/A, not 0",
+          "N/A" in rows.get("stock_momentum_v1", ""),
+          rows.get("stock_momentum_v1", ""))
+    check("crypto open column reads N/A, not 0",
+          "N/A" in rows.get("crypto_ema_atr_v1", ""),
+          rows.get("crypto_ema_atr_v1", ""))
+    check("ETF open position older than --since STILL counted",
+          " 1" in rows.get("etf_rotation_v1", ""),
+          rows.get("etf_rotation_v1", ""))
+    check("stock NOTES carry the unverified warning",
+          "UNVERIFIED" in ov, "")
+    check("non-mirrored bots get no 'N open position(s)' note",
+          "open position(s) NOT valued" not in ov
+          or "etf" in ov.lower(), "")
 
     print("\n[12f] Header and unknown bots")
     out = sb.render_bot_detail(

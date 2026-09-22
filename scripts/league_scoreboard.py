@@ -74,10 +74,22 @@ DEFAULT_SINCE = "2026-08-09"
 #: Below this, an average is an anecdote.
 MIN_MEANINGFUL_N = 30
 
+STOCK_POSITION_WARNING = (
+    "Stock position state is not mirrored into League bot_positions; "
+    "holdings are UNVERIFIED in this report."
+)
+
+CRYPTO_POSITION_WARNING = (
+    "Crypto position state is not mirrored into League bot_positions; "
+    "holdings are UNVERIFIED in this report."
+)
+
+
 #: Per-bot data-quality gaps, from the 2026-09 audit. Surfaced in NOTES so
 #: nobody reads a column that is structurally empty as a real zero.
 KNOWN_GAPS: dict[str, tuple[str, ...]] = {
     "stock_momentum_v1": (
+        STOCK_POSITION_WARNING + " Overview open=N/A means unverified holdings.",
         "bot_trades rows carry no quantity/order_id/run_id "
         "(league_status.log_trade call omits them) -> cannot reconcile "
         "against Public, and the (bot_id, order_id) dedup index is inert",
@@ -85,6 +97,7 @@ KNOWN_GAPS: dict[str, tuple[str, ...]] = {
         "singleton accumulated across runs in one long-lived process",
     ),
     "crypto_ema_atr_v1": (
+        CRYPTO_POSITION_WARNING + " Overview open=N/A means unverified holdings.",
         "bot_trades rows carry no amount_usd/pnl_pct",
         "fees ~$0.06/leg are NOT recorded; on $10-25 positions that is the "
         "same magnitude as the result itself",
@@ -600,6 +613,37 @@ def fmt_date(ts: Optional[str]) -> str:
 
 DETAIL_ROWS = 20          # per section
 
+
+#: Bots that do NOT mirror position state into League bot_positions.
+#:
+#: For these, an empty League positions result says NOTHING about what the
+#: bot holds. Printing "(no open positions)" would be a false statement
+#: about the portfolio rather than about the query — the same error class
+#: as reporting 0 runs when the fetch was truncated.
+#:
+#: Verified 2026-09-22 by grepping for league.upsert_position /
+#: league.close_position across bots/:
+#:
+#:   etf_rotation_v1     mirrors  (main.py:142,242,318,379)
+#:   short_watchlist_v1  mirrors  (main.py:171,231)
+#:   stock_momentum_v1   DOES NOT — its close_position (bot.py:554) writes
+#:                       to the STOCK project's own `positions` table
+#:   crypto_ema_atr_v1   DOES NOT — positions live in trader.positions and
+#:                       the crypto project's own bot_state
+#:
+#: Research bots (bond, agent) open no positions at all, so an empty result
+#: is genuinely empty for them and needs no warning.
+POSITIONS_NOT_MIRRORED: dict[str, str] = {
+    "stock_momentum_v1":
+        "Stock position state is written to the stock project's own "
+        "`positions` table. League mirroring was deferred (see migration "
+        "005 notes), so bot_positions is NOT authoritative for this bot.",
+    "crypto_ema_atr_v1":
+        "Crypto position state lives in trader.positions and the crypto "
+        "project's own bot_state. It is not mirrored into League "
+        "bot_positions, so this table is NOT authoritative for this bot.",
+}
+
 DETAIL_SPECS: dict[str, dict[str, Any]] = {
     "runs": {
         "table": "bot_runs",
@@ -623,6 +667,8 @@ DETAIL_SPECS: dict[str, dict[str, Any]] = {
         # Deliberately unwindowed: an open position may predate --since and
         # still be open. ETF has held four since May.
         "since_key": None,
+        # PostgREST filters before LIMIT; closed rows must not crowd out opens.
+        "filters": {"status": "eq.open"},
     },
     "errors": {
         "table": "bot_errors",
@@ -655,6 +701,7 @@ def build_detail_query(
         ("select", spec["select"]),
         ("bot_id", f"eq.{bot_id}"),
     ]
+    params.extend(spec.get("filters", {}).items())
     since_key = spec.get("since_key")
     if since_key and since:
         params.append((since_key, f"gte.{since}"))
@@ -675,7 +722,8 @@ def _cell(v: Any, width: int, *, num: bool = False, places: int = 2) -> str:
     return f"{s[:width]:<{width}}"
 
 
-def _section(title: str, rows: Optional[list[dict]], render) -> list[str]:
+def _section(title: str, rows: Optional[list[dict]], render, *,
+             empty_text: str = "(none in this window)") -> list[str]:
     """One detail section, with an honest empty/unreadable distinction.
 
     `None` means the fetch FAILED. Printing "none" for that would be a
@@ -688,7 +736,7 @@ def _section(title: str, rows: Optional[list[dict]], render) -> list[str]:
                    "Its absence below is NOT evidence of no activity.")
         return out
     if not rows:
-        out.append("  (none in this window)")
+        out.append(f"  {empty_text}")
         return out
     out.extend(render(rows))
     return out
@@ -788,9 +836,11 @@ def render_bot_detail(
     # ── 4. Open positions ─────────────────────────────────────────────────
     def _positions(rows):
         open_rows = [x for x in rows if (x.get("status") or "") == "open"]
+        gap = POSITIONS_NOT_MIRRORED.get(bot_id)
+        warning = ([f"  ⚠ HOLDINGS UNVERIFIED — {gap}"] if gap else [])
         if not open_rows:
-            return ["  (no open positions)"]
-        o = [f"  {'symbol':<8}{'entry_at':<20}{'entry':>10}{'qty':>12}"
+            return warning or ["  (no open positions)"]
+        o = warning + [f"  {'symbol':<8}{'entry_at':<20}{'entry':>10}{'qty':>12}"
              f"{'amt$':>9}{'mark_pnl$':>11}  {'L/P':<6}age"]
         for x in open_rows:
             meta = x.get("metadata") or {}
@@ -821,7 +871,16 @@ def render_bot_detail(
         o.append("    A blank means the position has never been marked at all.")
         return o
 
-    L.extend(_section("OPEN POSITIONS", sections.get("positions"), _positions))
+    # An empty result means "no open positions" ONLY for bots that actually
+    # mirror position state into League. For the others it means "this
+    # table does not know", which is a different statement and must not be
+    # rendered as a portfolio fact.
+    _pos_gap = POSITIONS_NOT_MIRRORED.get(bot_id)
+    L.extend(_section(
+        "OPEN POSITIONS", sections.get("positions"), _positions,
+        empty_text=(f"⚠ HOLDINGS UNVERIFIED — {_pos_gap}" if _pos_gap
+                    else "(no open positions)"),
+    ))
 
     # ── 5. Errors ─────────────────────────────────────────────────────────
     def _errors(rows):
@@ -996,7 +1055,8 @@ def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str],
 
     runs = summarize_runs(data.get("runs") or [], since)
     trades = summarize_trades(data.get("trades") or [], since)
-    open_pos = count_by_bot(data.get("positions") or [], "updated_at", since,
+    # Positions describe current state, independently of the history window.
+    open_pos = count_by_bot(data.get("positions") or [], "updated_at", None,
                             where={"status": "open"})
     err_rows = data.get("errors")
     errs = (count_by_bot(err_rows, "occurred_at", since)
@@ -1060,7 +1120,9 @@ def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str],
             f" | {fmt_n(paper['closed']):>8}"
             f"{fmt_pct(win_rate(paper['wins'], paper['closed'])):>7}"
             f"{fmt_money(paper['gross_pnl'] if paper['closed'] else None):>11}"
-            f" |{open_pos.get(bot, 0):>6}"
+            # 'N/A' rather than 0 for bots that do not mirror positions into
+            # League — 0 would assert a flat portfolio this table cannot see.
+            f" |{('N/A' if bot in POSITIONS_NOT_MIRRORED else open_pos.get(bot, 0)):>6}"
             f"{(f'{exp:8.2f}' if exp else '       —'):>9}"
             f"{fmt_money(net):>10}"
         )
@@ -1085,7 +1147,11 @@ def build_report(data: dict[str, Optional[list[dict]]], since: Optional[str],
             bot,
             live_closed=live["closed"],
             paper_closed=paper["closed"],
-            open_positions=open_pos.get(bot, 0),
+            # Suppress the "N open position(s) NOT valued" note for bots
+            # whose position rows League never receives — that note would
+            # imply the count is meaningful.
+            open_positions=(0 if bot in POSITIONS_NOT_MIRRORED
+                            else open_pos.get(bot, 0)),
             reported_errors=r.get("reported_errors", 0),
             actual_error_rows=(errs.get(bot, 0) if errs is not None else None),
             still_running=r.get("still_running", 0),
