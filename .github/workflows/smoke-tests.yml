@@ -222,6 +222,13 @@ jobs:
       - name: Smoke — dormant Public payload builders
         run: python -m league_core._public_payload_builders_smoke
 
+      # Read-only scoreboard. Tests the pure aggregation helpers only —
+      # no Supabase, no credentials. Also asserts structurally that the
+      # script never calls requests.post/patch/put/delete, so "read-only"
+      # is enforced rather than merely intended.
+      - name: Smoke — league scoreboard (read-only)
+        run: python -m scripts._scoreboard_smoke
+
       # Cheap structural guards. Each encodes a rule that a reviewer would
       # otherwise have to remember, and each maps to a real incident.
       - name: Guard — analytics must not import trading code
