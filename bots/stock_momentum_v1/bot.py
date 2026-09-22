@@ -2608,6 +2608,28 @@ def run_live_cycle(
                 # string, and the `continue` below are all untouched.
                 record_skipped_candidate(
                     sym, reason,
+                    # ADDED 2026-09-22. `price` was always null in
+                    # bot_missed_opportunities even when a real price was
+                    # known, because this call site never passed it — every
+                    # layer below (hook signature, pass-through, _to_float
+                    # insert) already supported it.
+                    #
+                    # The Phase 1 note claimed price was unavailable here
+                    # because get_daily_bars runs AFTER the skip. True on
+                    # the momentum path, WRONG on the breakout path:
+                    # check_breakout has already run by this point and
+                    # breakout_result.price is in scope — the BREAKOUT_CHECK
+                    # log three statements above formats that exact value,
+                    # which is why it kept showing up inside
+                    # indicators.breakout_reason while the price column
+                    # stayed empty.
+                    #
+                    # Reads a value already computed. NO new market-data
+                    # fetch is added to this loop. Stays None when the
+                    # breakout check did not run (symbols outside
+                    # MOMENTUM_SYMBOLS) — an honest null beats a price from
+                    # the wrong source.
+                    price=(breakout_result.price if breakout_result is not None else None),
                     score=(mom_score.score if (mom_score and mom_score.valid) else None),
                     rank=(mom_score.rank if (mom_score and mom_score.valid) else None),
                     regime=regime,

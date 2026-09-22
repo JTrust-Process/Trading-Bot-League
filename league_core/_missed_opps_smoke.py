@@ -284,6 +284,145 @@ def test_hook_contract() -> None:
         _clear_env()
 
 
+def test_price_survives_the_chain() -> None:
+    """price must reach the row payload, and be OMITTED (not null) when absent.
+
+    Regression fixed 2026-09-22. Every layer supported `price` — the hook
+    signature, the pass-through, the _to_float insert — and the one line
+    joining them to real data did not pass it. So bot_missed_opportunities
+    had a price column that was null on every row for eleven days, while
+    the same value sat visible inside indicators.breakout_reason.
+
+    That gap was invisible because the hook was tested and the insert was
+    tested; the CALL SITE was not, and it lives 1,100 lines deep inside
+    run_live_cycle where it cannot easily get a unit test. These assertions
+    cover the chain below the call site. The call site itself is verified
+    by reading bot.py — see the note at the end of this function.
+    """
+    print("\n[7] price survives hook -> insert -> row payload")
+    _clear_env()
+    os.environ["MISSED_OPP_TRACKING"] = "1"
+    os.environ["LEAGUE_SUPABASE_URL"] = "https://example.invalid"
+    os.environ["LEAGUE_SUPABASE_KEY"] = "fake-key"
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 201
+        text = ""
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):  # noqa: A002
+        captured["url"] = url
+        captured["rows"] = json
+        return _Resp()
+
+    real_post = mo.requests.post
+    try:
+        mo.requests.post = fake_post
+
+        # ── price present ─────────────────────────────────────────────────
+        ok = mo.safe_insert_missed_opportunity(
+            symbol="AAPL", skip_reason="momentum rank=2 score=0.0131, no breakout",
+            price=333.08, score=0.0131, rank=2, regime="bear",
+        )
+        check("insert reported success", ok is True)
+        rows = captured.get("rows") or []
+        check("one row posted", isinstance(rows, list) and len(rows) == 1,
+              f"got {rows!r}")
+        row = rows[0] if rows else {}
+        check("price present in row", "price" in row, f"keys={sorted(row)}")
+        check("price value preserved", row.get("price") == 333.08,
+              f"got {row.get('price')!r}")
+        check("price is a float, not a string", isinstance(row.get("price"), float))
+        check("row is JSON-serialisable", _json_ok(row))
+
+        # ── price absent -> key OMITTED, not null ─────────────────────────
+        captured.clear()
+        mo.safe_insert_missed_opportunity(
+            symbol="SGOV", skip_reason="no momentum or breakout signal",
+        )
+        row = (captured.get("rows") or [{}])[0]
+        check("price key OMITTED when None", "price" not in row,
+              f"keys={sorted(row)} — an explicit null is a different claim "
+              f"from 'not recorded'")
+        check("other fields still present", row.get("symbol") == "SGOV")
+
+        # Same rule for the other optional numerics.
+        for f in ("score", "signal_strength"):
+            check(f"{f} omitted when None", f not in row)
+
+        # ── hostile prices never reach the row ────────────────────────────
+        for bad, label in ((float("nan"), "NaN"), (float("inf"), "inf"),
+                           ("abc", "non-numeric")):
+            captured.clear()
+            mo.safe_insert_missed_opportunity(
+                symbol="X", skip_reason="r", price=bad)
+            row = (captured.get("rows") or [{}])[0]
+            check(f"price={label} omitted, no crash", "price" not in row,
+                  f"got {row.get('price')!r}")
+
+        # Zero and negative are NOT silently dropped — they are real values
+        # and a price of 0 would be a genuine data problem worth seeing.
+        captured.clear()
+        mo.safe_insert_missed_opportunity(symbol="X", skip_reason="r", price=0.0)
+        row = (captured.get("rows") or [{}])[0]
+        check("price=0.0 IS recorded (a real, visible anomaly)",
+              row.get("price") == 0.0, f"got {row.get('price')!r}")
+    finally:
+        mo.requests.post = real_post
+        _clear_env()
+
+    # ── the flag still gates everything ───────────────────────────────────
+    print("\n[7b] disabled behaviour unchanged by the price path")
+    _clear_env()
+    os.environ["LEAGUE_SUPABASE_URL"] = "https://example.invalid"
+    os.environ["LEAGUE_SUPABASE_KEY"] = "fake-key"
+    calls = {"n": 0}
+    real_post = mo.requests.post
+    try:
+        mo.requests.post = lambda *a, **k: calls.__setitem__("n", calls["n"] + 1)
+        r = mo.safe_insert_missed_opportunity(
+            symbol="AAPL", skip_reason="r", price=333.08)
+        check("returns False when flag unset", r is False)
+        check("zero network calls even with a price", calls["n"] == 0)
+    finally:
+        mo.requests.post = real_post
+        _clear_env()
+
+    # ── the call site actually passes price ───────────────────────────────
+    # Not a unit test: run_live_cycle cannot be invoked here. This asserts
+    # the one line that was missing is present, which is the specific
+    # regression. If the call is ever refactored, this fails loudly rather
+    # than the column silently going null again.
+    print("\n[7c] bot.py call site passes price=")
+    import pathlib
+    bot_py = (pathlib.Path(__file__).parent.parent
+              / "bots" / "stock_momentum_v1" / "bot.py")
+    try:
+        src = bot_py.read_text(encoding="utf-8")
+        check("record_skipped_candidate is called", "record_skipped_candidate(" in src)
+        check("call site passes price from breakout_result",
+              "price=(breakout_result.price if breakout_result is not None else None)"
+              in src,
+              "the call site must pass price; see bot_missed_opportunities "
+              "being null for 11 days")
+        check("no market-data fetch was added to the skip path",
+              src.count("get_daily_bars(sym)") == 2,
+              f"got {src.count('get_daily_bars(sym)')} calls — the hook must "
+              f"not introduce a third")
+    except Exception as e:  # noqa: BLE001
+        check("bot.py readable", False, repr(e))
+
+
+def _json_ok(obj) -> bool:
+    import json as _json
+    try:
+        _json.dumps(obj)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main() -> int:
     print("=" * 62)
     print("missed_opps smoke tests — no network, no AI, no API key")
@@ -295,6 +434,7 @@ def main() -> int:
     test_classify()
     test_forward_returns()
     test_hook_contract()
+    test_price_survives_the_chain()
     print("\n" + "=" * 62)
     print(f"  {_PASS} passed, {_FAIL} failed")
     print("=" * 62)

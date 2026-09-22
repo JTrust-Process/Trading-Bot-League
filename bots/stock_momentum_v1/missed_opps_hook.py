@@ -88,6 +88,23 @@ def record_skipped_candidate(
     before get_daily_bars() for that symbol, and fetching a price for a
     symbol the bot already rejected would add a network call to the entry
     loop. The scorer resolves the baseline close from history instead.
+
+    CORRECTED 2026-09-22. The paragraph above is true for the MOMENTUM
+    path and was wrong as a blanket claim. On the BREAKOUT path,
+    check_breakout has already run by the time a candidate is rejected, so
+    breakout_result.price is in scope and costs nothing to pass. The call
+    site now passes it.
+
+    The original claim caused an eleven-day gap where every row had a null
+    price while the very same number was visible inside
+    indicators.breakout_reason ("price=333.08 below threshold=341.28").
+    A docstring asserting a value is unavailable is not evidence that it
+    is; this one was written from the momentum path and never rechecked
+    against the branch beside it.
+
+    price is still None whenever the breakout check did not run — symbols
+    outside MOMENTUM_SYMBOLS — and that null is honest. No market-data
+    fetch has been added to the entry loop.
     """
     try:
         if _mo is None or not _enabled():
